@@ -1,6 +1,8 @@
-# SDK to MCP Converter
+# a37 takehome
 
-Convert SDK repositories into Model Context Protocol (MCP) servers using AI-powered analysis and code generation.
+Automated pipeline that analyzes Python SDKs and generates FastMCP servers with conda environments.
+
+The motivation for the structure of this project follows from this paper: https://arxiv.org/abs/2505.20286.
 
 ## Setup
 

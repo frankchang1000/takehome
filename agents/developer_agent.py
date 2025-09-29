@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-LangChain Developer Agent - Generates FastMCP servers from SDK analysis
+Direct Developer Agent - Generates FastMCP servers from SDK analysis
+Converted from LangChain to direct function calls for GPT-5 compatibility
 """
 
 import json
@@ -9,12 +10,8 @@ import subprocess
 import tempfile
 import yaml
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Dict, Optional, Any
 
-from langchain.tools import StructuredTool
-from langchain.agents import create_openai_functions_agent, AgentExecutor
-from langchain.prompts import ChatPromptTemplate
-from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 import re
 
@@ -26,349 +23,6 @@ except ImportError:
     EvaluationAgent = None
 
 
-def parse_markdown_analysis(markdown_content: str) -> tuple:
-    """Extract key information from structured markdown analysis optimized for MCP tools"""
-    
-    package_name = "unknown-sdk"
-    main_entry = ""
-    import_module = ""
-    auth_methods = []
-    main_classes = []
-    
-    lines = markdown_content.split('\n')
-    
-    # Extract package name from title (e.g., "# PyGithub - MCP Server Analysis")
-    for line in lines:
-        if line.startswith('# ') and ('MCP Server' in line or 'Analysis' in line):
-            title_match = re.search(r'# (\w+)', line)
-            if title_match:
-                package_name = title_match.group(1)
-            break
-    
-    # Extract from installation line (e.g., "**Installation:** `pip install PyGithub`")
-    for line in lines:
-        if '**Installation:**' in line and 'pip install' in line:
-            install_match = re.search(r'pip install ([^\s`]+)', line)
-            if install_match:
-                package_name = install_match.group(1)
-            break
-    
-    # Extract main entry point - NEW PATTERN: "**Main Entry Point:** github.Github (module `github`, class `Github`)"
-    for line in lines:
-        if '**Main Entry Point:**' in line:
-            # Try new format: github.Github (module `github`, class `Github`)
-            full_entry_match = re.search(r'\*\*Main Entry Point:\*\*\s*([^\s]+)\s*\(module\s*`([^`]+)`.*?class\s*`([^`]+)`', line)
-            if full_entry_match:
-                import_module = full_entry_match.group(2)  # e.g., "github"
-                main_entry = full_entry_match.group(3)     # e.g., "Github"
-                break
-            
-            # Fallback to old format: `Github`
-            entry_match = re.search(r'`([^`]+)`', line)
-            if entry_match:
-                main_entry = entry_match.group(1)
-                # Clean up entry point (e.g., "github.MainClass.Github" -> "Github")
-                if '.' in main_entry:
-                    main_entry = main_entry.split('.')[-1]
-            break
-    
-    # CUSTOM: Extract from "Primary import: from github import Github" format
-    for line in lines:
-        if 'Primary import:' in line and 'from' in line and 'import' in line:
-            import_match = re.search(r'import\s+([^\s\n]+)', line)
-            if import_match:
-                main_entry = import_match.group(1)
-            break
-    
-    # CUSTOM: Extract from "Primary class: github.MainClass.Github" format  
-    for line in lines:
-        if 'Primary class:' in line:
-            class_match = re.search(r'Primary class:\s*([^\s\n(]+)', line)
-            if class_match:
-                class_name = class_match.group(1)
-                # Clean up entry point (e.g., "github.MainClass.Github" -> "Github")
-                if '.' in class_name:
-                    main_entry = class_name.split('.')[-1]
-                else:
-                    main_entry = class_name
-            break
-    
-    # Extract authentication methods - NEW: Handle prose and code blocks
-    in_auth_section = False
-    current_auth_method = None
-    in_code_block = False
-    current_code = []
-    
-    for line in lines:
-        # Look for Authentication Setup section
-        if line.startswith('## Authentication Setup') or line.startswith('## Authentication'):
-            in_auth_section = True
-            continue
-        elif line.startswith('## ') and in_auth_section and 'authentication' not in line.lower():
-            in_auth_section = False
-            break
-            
-        if not in_auth_section:
-            continue
-            
-        # Track code blocks for extraction
-        if line.strip() == '```python':
-            in_code_block = True
-            current_code = []
-            continue
-        elif line.strip() == '```' and in_code_block:
-            in_code_block = False
-            # Process the collected code block
-            code_content = '\n'.join(current_code)
-            if current_auth_method:
-                current_auth_method["code_example"] = code_content
-            elif auth_methods:
-                # Add to the last auth method
-                auth_methods[-1]["code_example"] = code_content
-            else:
-                # Create a generic auth method from the code
-                if 'Auth.Token' in code_content:
-                    auth_methods.append({
-                        "name": "Token Authentication",
-                        "description": "Personal Access Token authentication",
-                        "code_example": code_content,
-                        "class": "github.Auth.Token"
-                    })
-            current_code = []
-            continue
-        elif in_code_block:
-            current_code.append(line)
-            continue
-        
-        # Look for structured auth method headers
-        if line.startswith('### '):
-            # New auth method
-            method_name = line.replace('### ', '').strip()
-            current_auth_method = {
-                "name": method_name,
-                "description": "",
-                "code_example": ""
-            }
-            auth_methods.append(current_auth_method)
-            continue
-            
-        # Extract method type from **Method:** lines
-        if line.startswith('**Method:**') and current_auth_method:
-            method_match = re.search(r'\*\*Method:\*\*\s*(.+)', line)
-            if method_match:
-                current_auth_method["description"] = method_match.group(1).strip()
-                
-        # Look for auth patterns in prose
-        if 'Auth.Token' in line and not current_auth_method:
-            auth_methods.append({
-                "name": "Token Authentication", 
-                "description": "Personal Access Token authentication using Auth.Token",
-                "code_example": "",
-                "class": "github.Auth.Token"
-            })
-            current_auth_method = auth_methods[-1]
-        
-        # Extract auth classes from various patterns
-        auth_class_patterns = [
-            r'github\.Auth\.Token',
-            r'Auth\.Token',
-            r'Github\(auth=auth\)',
-            r'from github import.*Auth'
-        ]
-        
-        for pattern in auth_class_patterns:
-            if re.search(pattern, line) and not any(m.get("class") for m in auth_methods):
-                if not auth_methods:
-                    auth_methods.append({
-                        "name": "Token Authentication",
-                        "description": "Authentication using personal access token",
-                        "code_example": "",
-                        "class": "github.Auth.Token"
-                    })
-    
-    # Extract main classes with structured method parsing - NEW: Handle enumerated sections
-    current_class = None
-    in_resource_section = False
-    extracting_crud = False
-    
-    for i, line in enumerate(lines):
-        # Look for enumerated resource sections like "1) Repository" or "2) Issue" 
-        enum_match = re.search(r'^(\d+)\)\s+(.+)$', line.strip())
-        if enum_match:
-            resource_name = enum_match.group(2).strip()
-            current_class = {
-                "name": resource_name,
-                "description": "",
-                "key_methods": [],
-                "primary_class": ""
-            }
-            main_classes.append(current_class)
-            in_resource_section = True
-            extracting_crud = False
-            continue
-        
-        # Stop processing this resource when we hit the next one or a major section
-        if in_resource_section and (line.startswith('## ') or 
-                                   (re.match(r'^\d+\)', line.strip()) and current_class)):
-            in_resource_section = False
-            extracting_crud = False
-            
-        if not in_resource_section or not current_class:
-            continue
-            
-        # Extract Primary Class info (e.g., "Primary Class: github.Repository.Repository")
-        if line.startswith('Primary Class:'):
-            class_match = re.search(r'Primary Class:\s*([^\s\n]+)', line)
-            if class_match:
-                current_class["primary_class"] = class_match.group(1)
-                # Also extract simple class name for compatibility
-                full_class = class_match.group(1)
-                if '.' in full_class:
-                    current_class["name"] = full_class.split('.')[-1]  # e.g., "Repository"
-        
-        # Extract description
-        if line.startswith('Description:') and current_class:
-            desc_match = re.search(r'Description:\s*(.+)', line)
-            if desc_match:
-                current_class["description"] = desc_match.group(1).strip()
-        
-        # Look for CRUD Operations section
-        if line.strip() == "CRUD Operations:":
-            extracting_crud = True
-            continue
-            
-        # Extract CRUD operations (e.g., "- CREATE: Organization.create_repo(name, ...) or AuthenticatedUser.create_repo")
-        if extracting_crud and current_class and line.startswith('- '):
-            crud_match = re.search(r'- ([A-Z]+):\s*(.+)', line)
-            if crud_match:
-                operation_type = crud_match.group(1).lower()  # create, read, update, delete
-                operation_desc = crud_match.group(2)
-                
-                # Extract method names from the description
-                # Look for patterns like "Organization.create_repo(name, ...)" or "Repository.edit(name=..., description=...)"
-                method_patterns = re.findall(r'([A-Za-z_]+\.[a-z_]+)\s*\(([^)]*)\)', operation_desc)
-                
-                for method_pattern, params in method_patterns:
-                    if '.' in method_pattern:
-                        method_name = method_pattern.split('.')[-1]  # get method name only
-                        # Check for duplicates
-                        existing_methods = [m["name"] for m in current_class["key_methods"]]
-                        if method_name not in existing_methods:
-                            # Preserve the full signature with parameters
-                            full_signature = f"{method_pattern}({params})"
-                            current_class["key_methods"].append({
-                                "name": method_name,
-                                "signature": full_signature,
-                                "description": f"{operation_type.title()} operation: {operation_desc[:100]}...",
-                                "operation_type": operation_type,
-                                "full_pattern": method_pattern
-                            })
-                
-                # Also look for direct method mentions without class prefix
-                if not method_patterns:
-                    # Look for method names in parentheses or after "via"
-                    direct_methods = re.findall(r'([a-z_]+)\s*\([^)]*\)', operation_desc)
-                    for method in direct_methods:
-                        # Check for duplicates
-                        existing_methods = [m["name"] for m in current_class["key_methods"]]
-                        if method not in existing_methods:
-                            current_class["key_methods"].append({
-                                "name": method,
-                                "signature": method + "()",
-                                "description": f"{operation_type.title()} operation: {operation_desc[:100]}...",
-                                "operation_type": operation_type
-                            })
-                continue
-        
-        # Stop extracting CRUD when we hit other sections
-        if extracting_crud and (line.startswith('Key Parameters:') or line.startswith('MCP')):
-            extracting_crud = False
-    
-    # Also extract CRUD operations for additional method information
-    in_crud_section = False
-    current_operation_type = None
-    
-    for line in lines:
-        if line.startswith('### CRUD Operations Summary'):
-            in_crud_section = True
-            continue
-        elif line.startswith('### ') and in_crud_section:
-            in_crud_section = False
-            break
-        elif line.startswith('## ') and in_crud_section:
-            in_crud_section = False
-            break
-            
-        if not in_crud_section:
-            continue
-            
-        # Track operation types (Create, Read, Update, Delete)
-        if line.startswith('**') and 'Operations:**' in line:
-            current_operation_type = line.replace('**', '').replace('Operations:', '').strip()
-            continue
-            
-        # Extract method signatures from CRUD lists
-        if line.startswith('- `') and '`' in line[3:]:
-            method_match = re.search(r'- `([^`]+)`\s*-\s*(.+)', line)
-            if method_match:
-                method_signature = method_match.group(1)
-                method_desc = method_match.group(2)
-                method_name = method_signature.split('(')[0] if '(' in method_signature else method_signature
-                
-                # Add to a generic "SDK" class if no specific class found
-                if not main_classes:
-                    main_classes.append({
-                        "name": main_entry or "SDK",
-                        "description": f"Main {package_name} SDK class",
-                        "key_methods": []
-                    })
-                
-                # Add method to the first/main class
-                if main_classes:
-                    # Check if method already exists
-                    existing_methods = [m["name"] for m in main_classes[0]["key_methods"]]
-                    if method_name not in existing_methods:
-                        main_classes[0]["key_methods"].append({
-                            "name": method_name,
-                            "signature": method_signature,
-                            "description": method_desc,
-                            "operation_type": current_operation_type
-                        })
-    
-    # Fallback: extract from patterns in the text if no structured info found
-    if not main_classes:
-        # Look for common patterns like "from package import ClassName"
-        for line in lines:
-            import_match = re.search(r'from \w+ import (\w+)', line)
-            if import_match:
-                class_name = import_match.group(1)
-                main_classes.append({
-                    "name": class_name,
-                    "description": f"Main class for {package_name}",
-                    "key_methods": []
-                })
-                break
-    
-    # Set import_module if not already set
-    if not import_module and package_name:
-        if package_name.lower() == "pygithub":
-            import_module = "github"
-        else:
-            import_module = package_name.lower()
-    
-    return package_name, main_entry, auth_methods, main_classes, import_module
-
-
-
-
-class DeveloperConfig(BaseModel):
-    """Configuration for developer agent"""
-    env_name: str = Field(description="Conda environment name")
-    output_dir: str = Field(description="Output directory for generated files")
-    python_version: str = Field(default="3.11", description="Python version")
-    sdk_package: str = Field(description="SDK package name")
-
-
 class DeveloperStatus(BaseModel):
     """Status of developer operations"""
     success: bool = Field(description="Whether operation succeeded")
@@ -377,100 +31,151 @@ class DeveloperStatus(BaseModel):
     artifacts: Dict[str, str] = Field(default_factory=dict, description="Generated file paths")
 
 
+def extract_package_info(markdown_content: str) -> tuple:
+    """Extract basic package information from markdown analysis (simplified)"""
+    
+    package_name = "unknown-sdk"
+    main_entry = ""
+    import_module = ""
+    
+    lines = markdown_content.split('\n')
+    
+    # Extract package name from installation line (most reliable)
+    for line in lines:
+        if '**Installation:**' in line and 'pip install' in line:
+            install_match = re.search(r'pip install ([^\s`]+)', line)
+            if install_match:
+                package_name = install_match.group(1)
+            break
+    
+    # Extract from title if installation not found
+    if package_name == "unknown-sdk":
+        for line in lines:
+            if line.startswith('# ') and ('MCP Server' in line or 'Analysis' in line):
+                title_match = re.search(r'# (\w+)', line)
+                if title_match:
+                    package_name = title_match.group(1)
+                break
+    
+    # Extract main entry point
+    for line in lines:
+        if '**Main Entry Point:**' in line:
+            # Try format: github.Github (module `github`, class `Github`)
+            full_entry_match = re.search(r'\*\*Main Entry Point:\*\*\s*([^\s]+)\s*\(module\s*`([^`]+)`.*?class\s*`([^`]+)`', line)
+            if full_entry_match:
+                import_module = full_entry_match.group(2)
+                main_entry = full_entry_match.group(3)
+                break
+            
+            # Fallback: extract just the class name
+            entry_match = re.search(r'`([^`]+)`', line)
+            if entry_match:
+                main_entry = entry_match.group(1)
+                if '.' in main_entry:
+                    main_entry = main_entry.split('.')[-1]
+            break
+    
+    # Set import_module if not found
+    if not import_module:
+        if package_name.lower() == 'pygithub':
+            import_module = 'github'
+        elif package_name.lower() == 'azure-sdk-for-python':
+            import_module = 'azure'
+        else:
+            import_module = package_name.lower().replace('-', '_')
+    
+    return package_name, main_entry, import_module
+
+
 def verify_environment_func(env_name: str) -> str:
     """Verify conda environment exists and can be used"""
     try:
         # Test environment activation by running a simple python command
         result = subprocess.run([
-            "conda", "run", "-n", env_name, "python", "-c", "import sys; print(sys.executable)"
+            "conda", "run", "-n", env_name, "python", "--version"
         ], capture_output=True, text=True, timeout=30)
         
         if result.returncode == 0:
-            python_path = result.stdout.strip()
-            status = DeveloperStatus(
-                success=True,
-                message=f"Environment '{env_name}' verified and ready",
-                details={
-                    "python_path": python_path,
-                    "env_name": env_name
-                }
-            )
+            python_version = result.stdout.strip()
+            return json.dumps({
+                "success": True,
+                "env_name": env_name,
+                "message": f"Environment '{env_name}' is ready",
+                "python_version": python_version
+            })
         else:
-            status = DeveloperStatus(
-                success=False,
-                message=f"Environment '{env_name}' not found or not working",
-                details={"error": result.stderr}
-            )
-        
-        return status.model_dump_json()
-        
+            return json.dumps({
+                "success": False,
+                "env_name": env_name,
+                "message": f"Environment '{env_name}' not accessible: {result.stderr}",
+                "error": result.stderr
+            })
+    
     except Exception as e:
-        status = DeveloperStatus(
-            success=False,
-            message=f"Error verifying environment: {str(e)}",
-            details={"error_type": type(e).__name__}
-        )
-        return status.model_dump_json()
+        return json.dumps({
+            "success": False,
+            "env_name": env_name,
+            "message": f"Environment verification failed: {str(e)}",
+            "error": str(e)
+        })
 
 
 def generate_server_code_func(generation_config: str) -> str:
-    """Generate FastMCP server code from SDK analysis (supports both JSON and markdown)"""
+    """Generate FastMCP server code from SDK analysis using GPT-5-nano"""
     try:
         config = json.loads(generation_config)
-        analysis_input = config.get("analysis_data") or config.get("analysis_file")
-        output_dir = config.get("output_dir")
+        analysis_data = config.get("analysis_data", {})
+        output_dir = config.get("output_dir", "./output")
+        raw_analysis = config.get("raw_analysis", "")  # Raw markdown content
         
-        # If analysis_input is None, treat the entire config as analysis data
-        if analysis_input is None:
-            analysis_input = config
-        
-        # If output_dir not provided, create default based on package name
-        if not output_dir:
-            package_name = config.get("package_name", "unknown-sdk")
-            output_dir = f"output/{package_name.lower().replace('_', '-')}"
+        # Extract basic information for fallback
+        package_name = analysis_data.get("package_name", "unknown-sdk")
         
         # Create output directory
         os.makedirs(output_dir, exist_ok=True)
         
-        # Determine if input is file path or data
-        if isinstance(analysis_input, str) and analysis_input.endswith('.md'):
-            # It's a markdown file path - read the file
-            analysis_file_path = analysis_input
-            if not os.path.exists(analysis_file_path):
-                raise FileNotFoundError(f"Analysis file not found: {analysis_file_path}")
-                
-            with open(analysis_file_path, 'r') as f:
-                markdown_content = f.read()
-            package_name, main_entry, auth_methods, main_classes, import_module = parse_markdown_analysis(markdown_content)
+        # Use AI generation if we have raw analysis content
+        if raw_analysis:
+            # Use GPT-5-nano to generate server code directly from markdown
+            server_code = generate_server_with_ai(raw_analysis, package_name)
         else:
-            # It's direct data from analysis_data dict (for compatibility)
-            analysis_data = analysis_input
-            package_name = analysis_data.get("package_name", "unknown-sdk")
-            main_entry = analysis_data.get("main_entry_point", "")
-            auth_methods = analysis_data.get("authentication", {}).get("methods", [])
-            main_classes = analysis_data.get("main_classes", [])
-        
-        # Generate server.py content
-        server_code = generate_fastmcp_server(
-            package_name=package_name,
-            main_entry=main_entry,
-            auth_methods=auth_methods if 'auth_methods' in locals() else [],
-            main_classes=main_classes if 'main_classes' in locals() else [],
-            import_module=import_module if 'import_module' in locals() else None
-        )
+            # Fallback to basic server if no raw analysis available
+            server_code = f"""#!/usr/bin/env python3
+\"\"\"
+FastMCP server for {package_name}
+Generated with basic fallback (no analysis content available)
+\"\"\"
+
+from fastmcp import FastMCP
+
+app = FastMCP("{package_name.lower()}-mcp")
+
+@app.tool()
+def get_server_info() -> dict:
+    \"\"\"Get basic server information\"\"\"
+    return {{
+        "package": "{package_name}",
+        "status": "running",
+        "note": "Basic fallback server - provide raw analysis for full generation"
+    }}
+
+if __name__ == "__main__":
+    app.run()
+"""
         
         # Write server.py
         server_path = os.path.join(output_dir, "server.py")
         with open(server_path, 'w') as f:
             f.write(server_code)
         
-        # Generate environment.yml
+        # Generate environment.yml using basic info
         env_yml = generate_environment_yml(package_name)
         env_path = os.path.join(output_dir, "environment.yml")
         with open(env_path, 'w') as f:
             yaml.dump(env_yml, f, default_flow_style=False)
         
-        # Generate README.md
+        # Generate README.md using basic info
+        main_entry = analysis_data.get("main_entry_point", package_name)
         readme_content = generate_readme(package_name, main_entry)
         readme_path = os.path.join(output_dir, "README.md")
         with open(readme_path, 'w') as f:
@@ -478,10 +183,10 @@ def generate_server_code_func(generation_config: str) -> str:
         
         status = DeveloperStatus(
             success=True,
-            message=f"Generated FastMCP server for {package_name}",
+            message=f"Generated FastMCP server for {package_name} {'using AI generation' if raw_analysis else 'using template'}",
             details={
                 "package_name": package_name,
-                "main_entry": main_entry,
+                "generation_method": "ai" if raw_analysis else "template",
                 "output_dir": output_dir
             },
             artifacts={
@@ -501,8 +206,178 @@ def generate_server_code_func(generation_config: str) -> str:
         return status.model_dump_json()
 
 
+def generate_server_with_ai(analysis_markdown: str, package_name: str) -> str:
+    """Generate FastMCP server code using GPT-5-nano from raw markdown analysis"""
+    import openai
+    
+    client = openai.OpenAI()
+    
+    prompt = f"""# FastMCP Server Generation Expert
+
+You are a world-class Python developer specializing in FastMCP server creation. Generate a production-ready MCP server from the following SDK analysis.
+
+## Task
+Generate a complete, production-ready FastMCP server for the {package_name} SDK based on the detailed analysis below.
+
+## Core Requirements
+
+### FastMCP Structure
+- Use `from fastmcp import FastMCP`
+- Create app with `app = FastMCP("{package_name.lower()}-mcp")`
+- Define tools with `@app.tool()` decorator
+- Include proper type hints and comprehensive docstrings
+- Add Pydantic models for complex parameters when needed
+
+### SDK Integration
+- Import: `from {package_name.lower().replace('-', '_')} import [MainClass]` (extract from analysis)
+- Dynamic client initialization with multiple auth patterns
+- Environment variable lookup: ['API_TOKEN', 'AUTH_TOKEN', 'ACCESS_TOKEN', '{package_name.upper()}_TOKEN']
+- Robust error handling with try-catch blocks
+- Handle SDK-specific exceptions appropriately
+
+### Authentication Patterns
+```python
+# Try different auth patterns dynamically:
+def _init_client(token: Optional[str] = None):
+    token_to_use = token or os.getenv('API_TOKEN') or os.getenv('AUTH_TOKEN') or os.getenv('ACCESS_TOKEN')
+    client = None
+    
+    if token_to_use:
+        try:
+            if hasattr(MainClass, '__init__'):
+                import inspect
+                init_sig = inspect.signature(MainClass.__init__)
+                if 'auth' in init_sig.parameters:
+                    # Token-based auth (GitHub style)
+                    module = __import__('{package_name.lower().replace('-', '_')}', fromlist=['Auth'])
+                    if hasattr(module, 'Auth') and hasattr(module.Auth, 'Token'):
+                        auth = module.Auth.Token(token_to_use)
+                        client = MainClass(auth=auth)
+                elif 'token' in init_sig.parameters:
+                    client = MainClass(token=token_to_use)
+                elif 'api_key' in init_sig.parameters:
+                    client = MainClass(api_key=token_to_use)
+        except Exception:
+            client = None
+    
+    if client is None:
+        client = MainClass()  # Fallback to anonymous/default
+    return client
+```
+
+### Tool Generation Rules
+1. **Function Naming**: Use descriptive names like `{package_name.lower()}_[operation]`
+2. **Parameters**: Extract from method signatures, use str type with sensible defaults
+3. **Return Type**: Always `-> dict` with structured response
+4. **Error Handling**: Comprehensive try-catch with structured error responses
+
+### Response Structure
+```python
+{{
+    "operation": "method_name",
+    "status": "success|error",
+    "data": result_data,
+    "class": "OriginatingClass", 
+    "method_signature": "original_signature",
+    "parameters_used": method_kwargs,
+    "error_message": "error details if failed"
+}}
+```
+
+### Tool Selection Guidelines
+- **Focus on the most useful operations** for an MCP server
+- **Include CRUD operations** (Create, Read, Update, Delete) where available
+- **Prioritize list/search operations** for resource discovery
+- **Include tools for common administrative tasks**
+- **Aim for 8-15 well-designed tools** covering the main SDK functionality
+- **Extract from the analysis**: Look for main classes, key methods, and common patterns
+
+### Code Quality Standards
+- Production-ready Python code with proper error handling
+- Type hints for all functions and parameters
+- Comprehensive exception handling with specific error types
+- Clear, descriptive tool names and detailed docstrings
+- Follow Python best practices and PEP 8
+- Include helper functions for common operations (client initialization, data serialization)
+
+### Data Serialization
+```python
+def _to_jsonable(obj):
+    \"\"\"Convert SDK objects to JSON-serializable format\"\"\"
+    try:
+        if hasattr(obj, 'raw_data'):
+            return obj.raw_data
+        if isinstance(obj, list):
+            return [_to_jsonable(i) for i in obj]
+        if isinstance(obj, dict):
+            return {{k: _to_jsonable(v) for k, v in obj.items()}}
+        if isinstance(obj, (str, int, float, bool)) or obj is None:
+            return obj
+        return str(obj)
+    except Exception:
+        return str(obj)
+```
+
+## SDK Analysis
+{analysis_markdown}
+
+## Output Format
+Generate ONLY the complete server.py file content. No explanations or markdown formatting.
+Start directly with the shebang line (#!/usr/bin/env python3) and include the complete FastMCP server implementation."""
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-5-nano",
+            messages=[{"role": "user", "content": prompt}],
+            max_completion_tokens=16000  # High allocation for complex server generation
+        )
+        
+        server_code = response.choices[0].message.content.strip()
+        
+        # Clean up any markdown formatting
+        if server_code.startswith("```python"):
+            server_code = server_code[9:]
+        if server_code.startswith("```"):
+            server_code = server_code[3:]
+        if server_code.endswith("```"):
+            server_code = server_code[:-3]
+        
+        server_code = server_code.strip()
+        
+        # Ensure it starts with shebang if not already
+        if not server_code.startswith("#!/usr/bin/env python3"):
+            server_code = "#!/usr/bin/env python3\n" + server_code
+        
+        return server_code
+        
+    except Exception as e:
+        # Fallback to basic server if AI generation fails
+        return f"""#!/usr/bin/env python3
+\"\"\"
+FastMCP server for {package_name}
+Generated with fallback due to AI generation error: {e}
+\"\"\"
+
+from fastmcp import FastMCP
+
+app = FastMCP("{package_name.lower()}-mcp")
+
+@app.tool()
+def get_server_info() -> dict:
+    \"\"\"Get basic server information\"\"\"
+    return {{
+        "package": "{package_name}",
+        "status": "running",
+        "error": "AI generation failed, using fallback server"
+    }}
+
+if __name__ == "__main__":
+    app.run()
+"""
+
+
 def evaluate_and_improve_server_func(eval_config: str) -> str:
-    """Evaluate and improve generated MCP server code using LangChain evaluation agent"""
+    """Evaluate and improve generated MCP server code using direct evaluation agent"""
     try:
         config = json.loads(eval_config)
         server_path = config["server_path"]
@@ -522,7 +397,7 @@ def evaluate_and_improve_server_func(eval_config: str) -> str:
         with open(server_path, 'r', encoding='utf-8') as f:
             original_code = f.read()
         
-        # Create evaluation agent
+        # Create evaluation agent (now using direct API)
         evaluator = EvaluationAgent(model="gpt-5-nano", verbose=False)
         
         # Run evaluation and improvement
@@ -533,791 +408,343 @@ def evaluate_and_improve_server_func(eval_config: str) -> str:
         )
         
         if result["success"]:
-            # Parse the result to see if improvements were made
-            agent_output = result["result"]
-            improvements_made = "improved" in agent_output.lower() or "enhancement" in agent_output.lower()
-            
-            # If the agent made improvements, we'd need to extract the improved code
-            # For now, we'll return the evaluation results
-            status = DeveloperStatus(
-                success=True,
-                message=f"Server evaluation completed for {package_name}",
-                details={
+            # If improvements were made, save the improved code
+            if result.get("status") == "improved" and "final_code" in result:
+                with open(server_path, 'w', encoding='utf-8') as f:
+                    f.write(result["final_code"])
+                
+                return json.dumps({
+                    "success": True,
+                    "message": f"Server code evaluated and improved. {result['result']}",
                     "evaluation_performed": True,
-                    "improvements_made": improvements_made,
-                    "evaluation_summary": agent_output[:500] + "..." if len(agent_output) > 500 else agent_output,
-                    "original_code_length": len(original_code)
-                }
-            )
-        else:
-            status = DeveloperStatus(
-                success=False,
-                message=f"Server evaluation failed: {result['error']}",
-                details={
+                    "improvements_made": True,
+                    "evaluation_summary": result.get("evaluation", {}),
+                    "improvement_summary": result.get("improvement", {})
+                })
+            else:
+                return json.dumps({
+                    "success": True,
+                    "message": f"Server code evaluated. {result['result']}",
                     "evaluation_performed": True,
                     "improvements_made": False,
-                    "error": result["error"]
-                }
-            )
-        
-        return status.model_dump_json()
+                    "evaluation_summary": result.get("evaluation", {})
+                })
+        else:
+            return json.dumps({
+                "success": False,
+                "message": f"Evaluation failed: {result.get('error', 'Unknown error')}",
+                "evaluation_performed": False,
+                "improvements_made": False
+            })
         
     except Exception as e:
-        status = DeveloperStatus(
-            success=False,
-            message=f"Error during server evaluation: {str(e)}",
-            details={"error_type": type(e).__name__}
-        )
-        return status.model_dump_json()
+        return json.dumps({
+            "success": False,
+            "message": f"Evaluation process failed: {str(e)}",
+            "evaluation_performed": False,
+            "improvements_made": False,
+            "error": str(e)
+        })
+
 
 def run_server_func(server_config: str) -> str:
     """Start the FastMCP server for testing"""
     try:
         config = json.loads(server_config)
-        env_name = config["env_name"]
         server_path = config["server_path"]
+        env_name = config.get("env_name")
         
-        # Start server in background using conda run
-        cmd = [
-            "conda", "run", "-n", env_name,
-            "python", server_path
-        ]
+        if not os.path.exists(server_path):
+            return json.dumps({
+                "success": False,
+                "message": f"Server file not found: {server_path}",
+                "server_path": server_path
+            })
         
-        # For now, just validate the server can be imported
-        validate_cmd = [
-            "conda", "run", "-n", env_name,
-            "python", "-c", f"import sys; sys.path.insert(0, '{os.path.dirname(server_path)}'); import server; print('Server validated successfully')"
-        ]
+        # Test that the server file can be imported without errors
+        test_cmd = ["python", "-c", f"import sys; sys.path.insert(0, '{os.path.dirname(server_path)}'); import {os.path.splitext(os.path.basename(server_path))[0]}; print('Server imported successfully')"]
         
-        result = subprocess.run(validate_cmd, capture_output=True, text=True, timeout=30)
+        if env_name:
+            # Run in conda environment
+            test_cmd = ["conda", "run", "-n", env_name] + test_cmd
+        
+        result = subprocess.run(test_cmd, capture_output=True, text=True, timeout=30)
         
         if result.returncode == 0:
-            status = DeveloperStatus(
-                success=True,
-                message="Server validated successfully",
-                details={
-                    "server_path": server_path,
-                    "env_name": env_name,
-                    "validation_output": result.stdout.strip()
-                }
-            )
+            return json.dumps({
+                "success": True,
+                "message": f"Server validation successful: {result.stdout.strip()}",
+                "server_path": server_path,
+                "env_name": env_name
+            })
         else:
-            status = DeveloperStatus(
-                success=False,
-                message="Server validation failed",
-                details={
-                    "error": result.stderr,
-                    "server_path": server_path
-                }
-            )
-        
-        return status.model_dump_json()
-        
+            return json.dumps({
+                "success": False,
+                "message": f"Server validation failed: {result.stderr}",
+                "server_path": server_path,
+                "env_name": env_name,
+                "error": result.stderr
+            })
+    
     except Exception as e:
-        status = DeveloperStatus(
-            success=False,
-            message=f"Error running server: {str(e)}",
-            details={"error_type": type(e).__name__}
-        )
-        return status.model_dump_json()
+        return json.dumps({
+            "success": False,
+            "message": f"Server testing failed: {str(e)}",
+            "error": str(e)
+        })
 
 
-def extract_method_parameters(signature: str) -> List[Dict]:
-    """Extract parameters from method signature (handles both Python signatures and natural language descriptions)"""
-    import re
-    
-    # Simple parameter extraction from signature
-    match = re.search(r'\((.*?)\)', signature)
-    if not match:
-        return []
-    
-    params_str = match.group(1).strip()
-    if not params_str:
-        return []
-    
-    # Handle natural language patterns like "name, ..." or "title, body=..., assignees=..."
-    params = []
-    
-    # Split parameters and clean them up
-    for param in params_str.split(','):
-        param = param.strip()
-        
-        # Skip ellipsis and empty params
-        if param in ['...', ''] or param.startswith('...'):
-            continue
-            
-        # Handle parameters with default values (name=value)
-        if '=' in param:
-            name, default = param.split('=', 1)
-            name = name.strip().split(':')[0].strip()  # Remove type hints
-            default = default.strip()
-            
-            # Clean up the name (remove dots, extra chars)
-            name = re.sub(r'[^a-zA-Z0-9_]', '', name)
-            
-            if name and name != 'self' and 'NotSet' not in name and len(name) > 0:
-                # Set reasonable defaults
-                if default in ['...', '""', "''"] or not default:
-                    default = 'None'
-                params.append({"name": name, "default": default, "required": False})
-        else:
-            # Handle required parameters
-            name = param.split(':')[0].strip()  # Remove type hints
-            
-            # Clean up the name (remove dots, extra chars, handle patterns like "full_name_or_id")
-            name = re.sub(r'[^a-zA-Z0-9_]', '', name)
-            
-            if name and name != 'self' and len(name) > 0:
-                params.append({"name": name, "required": True})
-    
-    return params[:5]  # Limit to 5 parameters to keep tools manageable
 
 
-def generate_parameter_definitions(params: List[Dict]) -> str:
-    """Generate function parameter definitions for MCP tool"""
-    if not params:
-        return ""
-    
-    param_strs = []
-    for param in params:
-        name = param["name"]
-        if param.get("required", True):
-            param_strs.append(f"{name}: str")
-        else:
-            default_val = param.get("default", "None")
-            if default_val == "NotSet" or "NotSet" in default_val or default_val in ['...', '""', "''"]:
-                default_val = "None"
-            param_strs.append(f"{name}: str = {default_val}")
-    
-    return ", ".join(param_strs) if param_strs else ""
-
-
-def generate_api_call_implementation(class_name: str, method_name: str, signature: str, params: List[Dict]) -> str:
-    """Generate generalized API call implementation that works for any SDK"""
-    
-    # Build parameter passing for the method call
-    param_args = []
-    param_prep = []
-    
-    for param in params:
-        name = param["name"]
-        if not param.get("required", True):
-            param_prep.append(f"        if {name} is not None and {name} != 'None':")
-            param_prep.append(f"            method_kwargs['{name}'] = {name}")
-        else:
-            param_prep.append(f"        method_kwargs['{name}'] = {name}")
-    
-    param_setup = "\n".join(param_prep)
-    
-    # Generate truly generalized implementation using dynamic method calling
-    return f'''        # Prepare method arguments
-        method_kwargs = {{}}
-{param_setup}
-        
-        # Get the appropriate client/object for this method
-        if hasattr(client, '{method_name}'):
-            # Direct method on main client (e.g., client.get_user())
-            target_object = client
-            method = getattr(target_object, '{method_name}')
-        else:
-            # May need to get an object first (e.g., repo.create_issue())
-            # For now, try the main client and provide helpful error
-            target_object = client
-            if hasattr(client, '{method_name}'):
-                method = getattr(target_object, '{method_name}')
-            else:
-                return {{
-                    "operation": "{method_name}",
-                    "status": "info",
-                    "message": f"Method '{method_name}' not found on client. May require getting a specific object first (e.g., repo, user, etc.)",
-                    "available_methods": [m for m in dir(client) if not m.startswith('_')],
-                    "class": "{class_name}",
-                    "parameters": method_kwargs
-                }}
-        
-        # Call the actual SDK method dynamically
-        result = method(**method_kwargs)
-        
-        # Handle different result types generically
-        if hasattr(result, '_rawData'):
-            # GitHub-style objects with _rawData
-            data = result._rawData
-        elif hasattr(result, '__dict__'):
-            # Objects with attributes - extract key ones
-            data = {{}}
-            for attr in dir(result):
-                if not attr.startswith('_') and not callable(getattr(result, attr)):
-                    try:
-                        value = getattr(result, attr)
-                        # Convert to JSON-serializable types
-                        if hasattr(value, 'isoformat'):  # datetime
-                            data[attr] = value.isoformat()
-                        elif isinstance(value, (str, int, float, bool, type(None))):
-                            data[attr] = value
-                        elif isinstance(value, (list, dict)):
-                            data[attr] = str(value)[:200] + "..." if len(str(value)) > 200 else value
-                    except:
-                        continue
-        elif isinstance(result, (list, dict, str, int, float, bool)):
-            # Simple types
-            data = result
-        else:
-            # Fallback - convert to string representation
-            data = str(result)
-        
-        return {{
-            "operation": "{method_name}",
-            "status": "success",
-            "data": data,
-            "class": "{class_name}",
-            "method_signature": "{signature}",
-            "parameters_used": method_kwargs
-        }}'''
-
-
-def generate_fastmcp_server(package_name: str, main_entry: str, auth_methods: List[Dict], main_classes: List[Dict], import_module: str = None) -> str:
-    """Generate FastMCP server code"""
-    
-    # Use provided import_module or fallback to package name conversion
-    if import_module:
-        import_name = import_module
-    elif package_name.lower() == "pygithub":
-        import_name = "github"
-    else:
-        import_name = package_name.lower()
-    
-    # Extract auth info
-    auth_examples = []
-    for method in auth_methods:
-        if "Token" in method.get("name", ""):
-            auth_examples.append('    # Token authentication\n    # auth = Auth.Token("your_token")\n    # client = Github(auth=auth)')
-        elif "Username" in method.get("name", ""):
-            auth_examples.append('    # Username/password authentication\n    # client = Github("username", "password")')
-    
-    auth_section = "\n".join(auth_examples) if auth_examples else "    # client = Github()"
-    
-    # Generate tool functions based on main classes
-    tool_functions = []
-    for cls in main_classes:
-        cls_name = cls.get("name", "")
-        methods = cls.get("key_methods", [])
-        
-        for method in methods[:3]:  # Limit to 3 methods per class to keep it manageable
-            method_name = method.get("name", "unknown") if isinstance(method, dict) else str(method)
-            tool_name = f"{cls_name.lower()}_{method_name}"
-            method_description = method.get("description", f"{method_name} operation") if isinstance(method, dict) else f"{method} operation"
-            method_signature = method.get("signature", method_name) if isinstance(method, dict) else method_name
-            # Generate functional tools instead of templates
-            safe_description = method_description.replace('"', '\\"').replace("'", "\\'")
-            
-            # Parse method signature to extract parameters
-            params = extract_method_parameters(method_signature) if isinstance(method, dict) else []
-            
-            # Generate parameter definitions for the tool
-            param_defs = generate_parameter_definitions(params)
-            
-            # Generate the actual API call implementation
-            api_call = generate_api_call_implementation(cls_name, method_name, method_signature, params)
-            
-            tool_functions.append(f'''
-@app.tool()
-def {tool_name}({param_defs}) -> dict:
-    """
-    {method_description} for {cls_name}
-    
-    Signature: {method_signature}
-    
-    Returns:
-        dict: Operation result with SDK API data
-    """
-    try:
-        # Initialize SDK client with authentication (generalized)
-        import os
-        client = None
-        
-        # Try different authentication patterns based on available environment variables
-        auth_env_vars = ['API_TOKEN', 'AUTH_TOKEN', 'ACCESS_TOKEN', 'GITHUB_TOKEN', 'AZURE_TOKEN', 'K8S_TOKEN']
-        token = None
-        for env_var in auth_env_vars:
-            token = os.getenv(env_var)
-            if token:
-                break
-        
-        if token:
-            # Try different authentication patterns for different SDKs
-            try:
-                # Pattern 1: SDK with auth parameter (GitHub style)
-                if hasattr({main_entry}, '__init__'):
-                    import inspect
-                    init_sig = inspect.signature({main_entry}.__init__)
-                    if 'auth' in init_sig.parameters:
-                        # Try to find Auth class in the same module
-                        module = __import__('{import_name}', fromlist=['Auth'])
-                        if hasattr(module, 'Auth') and hasattr(module.Auth, 'Token'):
-                            auth = module.Auth.Token(token)
-                            client = {main_entry}(auth=auth)
-                        else:
-                            client = {main_entry}()
-                    elif 'token' in init_sig.parameters:
-                        # Direct token parameter
-                        client = {main_entry}(token=token)
-                    elif 'api_key' in init_sig.parameters:
-                        # API key parameter
-                        client = {main_entry}(api_key=token)
-                    else:
-                        client = {main_entry}()
-                else:
-                    client = {main_entry}()
-            except Exception:
-                # Fallback to basic initialization
-                client = {main_entry}()
-        else:
-            # No authentication - basic client
-            client = {main_entry}()
-        
-        # Execute the actual SDK API call
-{api_call}
-        
-    except Exception as e:
-        return {{
-            "operation": "{method_name}",
-            "status": "error", 
-            "message": str(e),
-            "error_type": type(e).__name__
-        }}''')
-    
-    tools_section = "\n".join(tool_functions)
-    
-    server_template = f'''#!/usr/bin/env python3
-"""
-FastMCP server for {package_name}
-Generated automatically from SDK analysis
-"""
-
-from fastmcp import FastMCP
-from pydantic import BaseModel
-from typing import Dict, List, Optional, Any
-
-try:
-    from {import_name} import {main_entry}
-    if "{import_name}" == "github":
-        from github import Auth
-except ImportError as e:
-    print(f"Warning: Could not import {package_name}: {{e}}")
-    print("Please ensure the package is installed in your environment")
-
-# Initialize FastMCP app
-app = FastMCP("{package_name.lower()}-mcp")
-
-# Configuration model
-class {package_name}Config(BaseModel):
-    """Configuration for {package_name} MCP server"""
-    # Add configuration fields as needed
-    # token: Optional[str] = None
-    # base_url: Optional[str] = None
-    pass
-
-# Global configuration
-config = {package_name}Config()
-
-@app.tool()
-def get_server_info() -> dict:
-    """
-    Get information about this MCP server
-    
-    Returns:
-        dict: Server information including package name and available operations
-    """
-    return {{
-        "package": "{package_name}",
-        "server_type": "FastMCP",
-        "status": "running",
-        "description": "MCP server for {package_name} SDK"
-    }}
-
-{tools_section}
-
-if __name__ == "__main__":
-    print(f"Starting {package_name} MCP server...")
-    print("Use 'fastmcp dev server.py' to run with MCP Inspector")
-    app.run()
-'''
-    
-    return server_template
-
-
-def generate_environment_yml(package_name: str) -> Dict:
-    """Generate environment.yml for the MCP server"""
-    env_name = f"mcp-{package_name.lower().replace('_', '-')}"
-    
-    env_yml = {
-        "name": env_name,
+def generate_environment_yml(package_name: str) -> dict:
+    """Generate environment.yml for the package"""
+    return {
+        "name": f"mcp-{package_name.lower()}",
         "channels": ["conda-forge", "defaults"],
         "dependencies": [
             "python=3.11",
             "pip",
             {
                 "pip": [
-                    "fastmcp>=0.1.0",
-                    "pydantic>=2.0.0",
+                    "fastmcp",
                     package_name
                 ]
             }
         ]
     }
-    
-    return env_yml
 
 
 def generate_readme(package_name: str, main_entry: str) -> str:
     """Generate README.md for the MCP server"""
-    env_name = f"mcp-{package_name.lower().replace('_', '-')}"
     
     readme_template = f'''# {package_name} MCP Server
 
-This is an automatically generated Model Context Protocol (MCP) server for the {package_name} SDK.
+FastMCP server for {package_name} SDK integration.
 
-## Setup
+## Installation
 
-1. Create and activate the conda environment:
-```bash
-conda env create -f environment.yml
-conda activate {env_name}
-```
+1. Create conda environment:
+   ```bash
+   conda env create -f environment.yml
+   conda activate mcp-{package_name.lower()}
+   ```
 
-2. Install FastMCP if not already installed:
-```bash
-pip install fastmcp
-```
+2. Install the server:
+   ```bash
+   pip install fastmcp {package_name}
+   ```
 
-## Running the Server
+## Usage
 
-### Development Mode (with MCP Inspector)
-```bash
-fastmcp dev server.py
-```
-
-This will start the server and open the MCP Inspector for interactive testing.
-
-### Production Mode
+### Direct Usage
 ```bash
 python server.py
 ```
 
+### With MCP Inspector
+```bash
+fastmcp dev server.py
+```
+
+### Configuration
+
+The server supports configuration through environment variables:
+- `API_TOKEN` or `ACCESS_TOKEN`: Authentication token for {package_name}
+
 ## Available Tools
 
-The server provides MCP tools for common {package_name} operations. Use the MCP Inspector to explore available tools and their schemas.
+- `get_server_info`: Get server information and status
+- Additional tools based on {package_name} SDK capabilities
 
-## Configuration
+## Development
 
-Edit the server.py file to:
-- Add authentication credentials
-- Customize tool implementations  
-- Add additional tools as needed
+This server was generated automatically from {package_name} SDK analysis.
+To modify or extend functionality, edit `server.py` directly.
 
 ## Authentication
 
-Configure authentication in the server.py file according to your {package_name} setup requirements.
+{'Refer to ' + package_name + ' documentation for authentication setup.' if main_entry else 'No authentication required for basic usage.'}
 
-## Generated Files
+## Support
 
-- `server.py`: Main FastMCP server implementation
-- `environment.yml`: Conda environment specification
-- `README.md`: This documentation file
-
-## Next Steps
-
-1. Test the server using MCP Inspector
-2. Customize tool implementations for your use case
-3. Add proper authentication configuration
-4. Deploy as needed for your application
-
-For more information about MCP and FastMCP, visit:
-- [Model Context Protocol](https://github.com/mcp-python/fastmcp)
-- [FastMCP Documentation](https://github.com/mcp-python/fastmcp)
+For issues related to the MCP server, check the FastMCP documentation.
+For {package_name} specific issues, refer to the official {package_name} documentation.
 '''
     
     return readme_template
 
 
 class DeveloperAgent:
-    """LangChain agent for MCP server development"""
+    """Direct developer agent for MCP server development - no LangChain needed"""
     
     def __init__(self, model: str = "gpt-5-nano", verbose: bool = False):
+        # Model parameter kept for backward compatibility 
+        # Most operations are deterministic - AI only used via evaluation agent
         self.model = model
         self.verbose = verbose
-        
-        # GPT-5 models require Responses API, not Chat Completions
-        if model.startswith("gpt-5"):
-            if verbose:
-                print(f"Note: Using {model} with Responses API for better reasoning")
-            # We'll handle GPT-5 calls differently in the workflow
-            self.use_gpt5 = True
-            # For LangChain compatibility, use gpt-4o-mini as fallback
-            self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-        else:
-            self.use_gpt5 = False
-            self.llm = ChatOpenAI(model=model, temperature=0)
-        
-        # Create tools using StructuredTool
-        self.tools = [
-            StructuredTool.from_function(
-                func=verify_environment_func,
-                name="verify_environment", 
-                description="Verify conda environment exists and is ready for use"
-            ),
-            StructuredTool.from_function(
-                func=generate_server_code_func,
-                name="generate_server_code",
-                description="Generate FastMCP server code from SDK analysis"
-            ),
-            StructuredTool.from_function(
-                func=evaluate_and_improve_server_func,
-                name="evaluate_and_improve_server",
-                description="Evaluate and improve generated MCP server code using AI analysis"
-            ),
-            StructuredTool.from_function(
-                func=run_server_func,
-                name="run_server",
-                description="Validate and test the generated MCP server"
-            )
-        ]
-        
-        # Create agent prompt
-        self.prompt = ChatPromptTemplate.from_messages([
-            ("system", """You are a developer specialist for creating FastMCP servers. Your job is to generate production-ready MCP servers from SDK analysis data.
-
-Available tools:
-- verify_environment: Verify conda environment exists and is ready for use
-- generate_server_code: Generate FastMCP server code, environment.yml, and README
-- evaluate_and_improve_server: Evaluate and improve generated server code using AI analysis
-- run_server: Validate the generated server works correctly
-
-When creating MCP servers:
-1. Verify the conda environment exists (created by the environment agent)
-2. Generate clean, modular FastMCP server code based on the SDK analysis
-3. Evaluate and improve the generated code for quality, compliance, and best practices
-4. Create all necessary configuration files and documentation
-5. Validate that the server works correctly using the conda environment
-6. Provide clear next steps for the user
-
-Focus on creating maintainable, type-safe code with proper error handling and documentation. Be decisive and provide clear status updates throughout the process."""),
-            ("human", "{input}"),
-            ("placeholder", "{agent_scratchpad}")
-        ])
-        
-        # Create agent
-        self.agent = create_openai_functions_agent(
-            llm=self.llm,
-            tools=self.tools,
-            prompt=self.prompt
-        )
-        
-        # Create executor
-        self.executor = AgentExecutor(
-            agent=self.agent,
-            tools=self.tools,
-            verbose=self.verbose,
-            max_iterations=5,
-            handle_parsing_errors=True
-        )
     
-    def generate_mcp_server_with_gpt5(self, analysis_data: Dict[str, Any], env_name: str, output_dir: str = None) -> Dict[str, Any]:
-        """Generate MCP server using GPT-5 Responses API directly"""
-        from openai import OpenAI
-        
-        if output_dir is None:
-            package_name = self.extract_package_name(analysis_data)
-            output_dir = f"./output/{package_name.lower().replace('_', '-')}"
-        
-        try:
-            client = OpenAI()
-            
-            # Create the prompt for GPT-5
-            prompt = f"""
-            Generate a complete FastMCP server for the analyzed SDK.
-            
-            Environment: {env_name} (already created)
-            Output Directory: {output_dir}
-            
-            SDK Analysis Data:
-            {json.dumps(analysis_data, indent=2)}
-            
-            Tasks to complete:
-            1. Verify the conda environment exists: {env_name}
-            2. Generate FastMCP server code with proper tools based on the analysis
-            3. Evaluate and improve the generated code for quality and best practices
-            4. Create environment.yml, README.md, and other necessary files
-            5. Validate that the server works correctly using the conda environment
-            
-            Make sure the generated code is:
-            - Clean and modular
-            - Type-safe with proper type hints
-            - Well documented with docstrings
-            - Production-ready with error handling
-            - Compliant with MCP and FastMCP best practices
-            
-            Provide step-by-step execution plan and implement each step.
-            """
-            
-            # Use GPT-5 Responses API
-            response = client.responses.create(
-                model=self.model,
-                input=prompt,
-                reasoning={"effort": "medium"},
-                text={"verbosity": "medium"}
-            )
-            
-            # Extract the response content
-            if hasattr(response, 'output_text'):
-                result_text = response.output_text
-            elif hasattr(response, 'output'):
-                # Handle different response structures
-                result_text = ""
-                for item in response.output:
-                    if hasattr(item, 'type') and item.type == "message":
-                        if hasattr(item, 'content'):
-                            for content_part in item.content:
-                                if hasattr(content_part, 'text'):
-                                    result_text += content_part.text
-            else:
-                result_text = str(response)
-            
-            # For now, we'll execute the individual steps manually
-            # This is a simplified implementation that calls the original tools
-            
-            # Step 1: Verify environment
-            verify_result = verify_environment_func(env_name)
-            verify_data = json.loads(verify_result)
-            if not verify_data["success"]:
-                return {
-                    "success": False,
-                    "error": f"Environment verification failed: {verify_data['message']}",
-                    "output_dir": output_dir,
-                    "env_name": env_name
-                }
-            
-            # Step 2: Generate server code
-            generation_config = {
-                "analysis_data": analysis_data,
-                "output_dir": output_dir,
-                "package_name": analysis_data.get("package_name", "unknown-sdk")
-            }
-            gen_result = generate_server_code_func(json.dumps(generation_config))
-            gen_data = json.loads(gen_result)
-            if not gen_data["success"]:
-                return {
-                    "success": False,
-                    "error": f"Code generation failed: {gen_data['message']}",
-                    "output_dir": output_dir,
-                    "env_name": env_name
-                }
-            
-            # Step 3: Evaluate and improve (if evaluation agent available)
-            if EvaluationAgent is not None:
-                server_path = gen_data["artifacts"].get("server")
-                if server_path:
-                    eval_config = {
-                        "server_path": server_path,
-                        "analysis_data": analysis_data,
-                        "package_name": analysis_data.get("package_name", "unknown"),
-                        "enable_evaluation": True
-                    }
-                    eval_result = evaluate_and_improve_server_func(json.dumps(eval_config))
-                    eval_data = json.loads(eval_result)
-                    if self.verbose:
-                        print(f"Evaluation result: {eval_data['message']}")
-            
-            return {
-                "success": True,
-                "result": f"GPT-5 MCP server generated successfully using {self.model}. {result_text[:200]}...",
-                "output_dir": output_dir,
-                "env_name": env_name,
-                "gpt5_reasoning": result_text
-            }
-            
-        except Exception as e:
-            return {
-                "success": False,
-                "error": f"GPT-5 generation failed: {str(e)}",
-                "output_dir": output_dir,
-                "env_name": env_name
-            }
+    def verify_environment(self, env_name: str) -> Dict[str, Any]:
+        """Verify conda environment exists and is ready for use"""
+        result_json = verify_environment_func(env_name)
+        return json.loads(result_json)
+    
+    def generate_server_code(self, analysis_data: Dict[str, Any], output_dir: str, raw_analysis: str = "") -> Dict[str, Any]:
+        """Generate FastMCP server code from SDK analysis"""
+        config = {
+            "analysis_data": analysis_data,
+            "output_dir": output_dir,
+            "raw_analysis": raw_analysis  # Pass raw markdown for AI generation
+        }
+        result_json = generate_server_code_func(json.dumps(config))
+        return json.loads(result_json)
+    
+    def evaluate_and_improve_server(self, server_path: str, analysis_data: Dict[str, Any], package_name: str) -> Dict[str, Any]:
+        """Evaluate and improve generated MCP server code"""
+        config = {
+            "server_path": server_path,
+            "analysis_data": analysis_data,
+            "package_name": package_name,
+            "enable_evaluation": True
+        }
+        result_json = evaluate_and_improve_server_func(json.dumps(config))
+        return json.loads(result_json)
+    
+    def run_server(self, server_path: str, env_name: str = None) -> Dict[str, Any]:
+        """Validate and test the generated MCP server"""
+        config = {
+            "server_path": server_path,
+            "env_name": env_name
+        }
+        result_json = run_server_func(json.dumps(config))
+        return json.loads(result_json)
     
     def generate_mcp_server(self, analysis_data: Dict[str, Any], env_name: str, output_dir: str = None) -> Dict[str, Any]:
-        """Generate complete MCP server from SDK analysis"""
+        """Generate MCP server - main interface for backward compatibility"""
         
-        # Use GPT-5 Responses API if GPT-5 model is specified
-        if self.use_gpt5:
-            return self.generate_mcp_server_with_gpt5(analysis_data, env_name, output_dir)
-        
-        # Set default output directory if not provided
         if output_dir is None:
             package_name = self.extract_package_name(analysis_data)
             output_dir = f"./output/{package_name.lower().replace('_', '-')}"
         
-        # Create request
-        request = f"""
-        Generate a complete FastMCP server for the analyzed SDK.
-        
-        Environment: {env_name}
-        Output Directory: {output_dir}
-        
-        SDK Analysis Data:
-        {json.dumps(analysis_data, indent=2)}
-        
-        Follow this process:
-        1. Verify the conda environment is available: {env_name}
-        2. Generate FastMCP server code with proper tools based on the analysis
-        3. Evaluate and improve the generated code for quality and best practices
-        4. Create environment.yml, README.md, and other necessary files
-        5. Validate that the server works correctly using the conda environment
-        
-        Make sure the generated code is:
-        - Clean and modular
-        - Type-safe with proper type hints
-        - Well documented with docstrings
-        - Production-ready with error handling
-        - Compliant with MCP and FastMCP best practices
-        
-        Provide a summary of what was generated, evaluation results, and next steps.
-        """
-        
         try:
-            result = self.executor.invoke({"input": request})
+            if self.verbose:
+                print(f"🔧 Generating MCP server...")
+                print(f"📦 Package: {analysis_data.get('package_name', 'unknown')}")
+                print(f"🌍 Environment: {env_name}")
+                print(f"📁 Output: {output_dir}")
+            
+            # Step 1: Verify environment
+            if self.verbose:
+                print("1️⃣ Verifying environment...")
+            
+            env_result = self.verify_environment(env_name)
+            if not env_result["success"]:
+                return {
+                    "success": False,
+                    "error": f"Environment verification failed: {env_result['message']}",
+                    "step": "environment_verification"
+                }
+            
+            if self.verbose:
+                print("✅ Environment verified")
+            
+            # Step 2: Generate server code
+            if self.verbose:
+                print("2️⃣ Generating server code...")
+            
+            # Check if we have raw markdown content for AI generation
+            raw_analysis = analysis_data.get("raw_markdown", "")
+            generation_result = self.generate_server_code(analysis_data, output_dir, raw_analysis)
+            if not generation_result["success"]:
+                return {
+                    "success": False,
+                    "error": f"Code generation failed: {generation_result['message']}",
+                    "step": "code_generation"
+                }
+            
+            server_path = generation_result["artifacts"]["server"]
+            if self.verbose:
+                print(f"✅ Server code generated: {server_path}")
+            
+            # Step 3: Evaluate and improve server code
+            if self.verbose:
+                print("3️⃣ Evaluating and improving code...")
+            
+            package_name = analysis_data.get("package_name", "unknown")
+            eval_result = self.evaluate_and_improve_server(server_path, analysis_data, package_name)
+            
+            if eval_result["success"] and eval_result.get("improvements_made"):
+                if self.verbose:
+                    print("✅ Code evaluated and improved")
+            elif eval_result["success"]:
+                if self.verbose:
+                    print("✅ Code evaluated (no improvements needed)")
+            else:
+                if self.verbose:
+                    print(f"⚠️  Evaluation failed: {eval_result['message']}")
+            
+            # Step 4: Validate server
+            if self.verbose:
+                print("4️⃣ Validating server...")
+            
+            validation_result = self.run_server(server_path, env_name)
+            if validation_result["success"]:
+                if self.verbose:
+                    print("✅ Server validation passed")
+            else:
+                if self.verbose:
+                    print(f"⚠️  Server validation failed: {validation_result['message']}")
+            
+            # Return comprehensive result
             return {
                 "success": True,
-                "result": result["output"],
-                "output_dir": output_dir,
-                "env_name": env_name
+                "result": f"MCP server generation completed for {package_name}",
+                "details": {
+                    "package_name": package_name,
+                    "output_dir": output_dir,
+                    "env_name": env_name,
+                    "environment_verification": env_result,
+                    "code_generation": generation_result,
+                    "evaluation": eval_result,
+                    "validation": validation_result
+                },
+                "artifacts": generation_result.get("artifacts", {}),
+                "next_steps": [
+                    f"Activate environment: conda activate {env_name}",
+                    f"Run server: cd {output_dir} && python server.py",
+                    f"Or use MCP Inspector: cd {output_dir} && fastmcp dev server.py"
+                ]
             }
+            
         except Exception as e:
+            if self.verbose:
+                print(f"❌ Server generation failed: {e}")
+            
             return {
                 "success": False,
                 "error": str(e),
-                "output_dir": output_dir,
-                "env_name": env_name
+                "env_name": env_name,
+                "output_dir": output_dir
             }
     
     def extract_package_name(self, analysis_data: Dict[str, Any]) -> str:
         """Extract package name from analysis data (same logic as environment agent)"""
-        package_name = "unknown-sdk"
         
-        # Parse nested JSON in summary field
-        summary = analysis_data.get("summary", "")
-        if summary.startswith("```json\n") and summary.endswith("\n```"):
-            try:
-                json_str = summary[8:-4]
-                nested_data = json.loads(json_str)
-                package_name = nested_data.get("package_name", "unknown-sdk")
-            except (json.JSONDecodeError, KeyError):
-                # Fallback to repo URL parsing
-                repo_url = analysis_data.get("repo_url", "")
-                if repo_url and "github.com" in repo_url:
-                    import re
-                    match = re.search(r'github\.com/[^/]+/([^/]+)', repo_url)
-                    if match:
-                        package_name = match.group(1)
+        # Try different possible keys for package name
+        package_name = (
+            analysis_data.get("package_name") or
+            analysis_data.get("name") or 
+            analysis_data.get("sdk_name") or
+            "unknown-sdk"
+        )
+        
+        # Clean up the package name
+        if isinstance(package_name, str):
+            # Remove common prefixes/suffixes
+            package_name = package_name.replace("python-", "").replace("-python", "")
+            package_name = package_name.replace("sdk-", "").replace("-sdk", "")
+            # Handle special cases
+            if package_name.lower() in ["azure-sdk-for-python", "azure"]:
+                package_name = "azure-sdk-for-python"
         
         return package_name
 
@@ -1338,21 +765,24 @@ def main():
     # Load analysis data (markdown format only)
     try:
         if not args.analysis.endswith('.md'):
-            print(f"Error: Expected markdown file (.md), got: {args.analysis}")
+            print(f"❌ Error: Expected markdown file (.md), got: {args.analysis}")
             return 1
             
         with open(args.analysis, 'r', encoding='utf-8') as f:
             markdown_content = f.read()
-        package_name, main_entry, auth_methods, main_classes, import_module = parse_markdown_analysis(markdown_content)
-        # Convert to dict format for compatibility with existing code
+        
+        # Extract basic package info and include raw markdown for AI generation
+        package_name, main_entry, import_module = extract_package_info(markdown_content)
+        
+        # Create analysis data with raw markdown for AI generation
         analysis_data = {
             "package_name": package_name,
             "main_entry_point": main_entry, 
-            "authentication": {"methods": auth_methods},
-            "main_classes": main_classes
+            "import_module": import_module,
+            "raw_markdown": markdown_content  # Include raw content for AI generation
         }
     except Exception as e:
-        print(f"Error loading analysis file: {e}")
+        print(f"❌ Error loading analysis file: {e}")
         return 1
     
     # Create agent
@@ -1365,7 +795,7 @@ def main():
         output_dir = f"output/{package_name.lower().replace('_', '-')}"
     
     # Generate MCP server
-    print("Generating FastMCP server...")
+    print("🚀 Generating FastMCP server...")
     result = agent.generate_mcp_server(
         analysis_data=analysis_data,
         env_name=args.env_name,
@@ -1373,13 +803,16 @@ def main():
     )
     
     if result["success"]:
-        print(f"✅ MCP server generated successfully!")
-        print(f"Output directory: {result['output_dir']}")
-        print(f"Environment: {result['env_name']}")
-        print(f"Details: {result['result']}")
+        print("✅ MCP server generation completed successfully!")
+        print(f"📁 Output directory: {result['details']['output_dir']}")
+        print("🎯 Next steps:")
+        for step in result.get("next_steps", []):
+            print(f"   • {step}")
     else:
-        print(f"❌ MCP server generation failed!")
-        print(f"Error: {result['error']}")
+        print("❌ MCP server generation failed!")
+        print(f"Error: {result.get('error', 'Unknown error')}")
+        if 'step' in result:
+            print(f"Failed at step: {result['step']}")
         return 1
     
     return 0

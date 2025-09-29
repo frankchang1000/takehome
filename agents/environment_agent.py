@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-LangChain Environment Agent - Handles conda environment creation and validation
+Direct Environment Agent - Handles conda environment creation and validation
+Converted from LangChain to direct subprocess calls for simplicity and reliability
 """
 
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -11,7 +13,7 @@ import yaml
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 
-# LangChain imports removed - now using direct function calls
+import openai
 from pydantic import BaseModel, Field
 
 
@@ -98,54 +100,42 @@ def create_environment_func(env_config: str) -> str:
                 status = EnvironmentStatus(
                     success=True,
                     env_name=config.name,
-                    message=f"Environment '{config.name}' created successfully with conda",
+                    message=f"Environment '{config.name}' created successfully",
                     details={
                         "python_version": config.python_version,
                         "packages": config.packages,
-                        "tool_used": "conda",
-                        "env_file": env_file
+                        "channels": config.channels,
+                        "stdout": result.stdout
                     }
                 )
-                return status.model_dump_json()
             else:
                 status = EnvironmentStatus(
                     success=False,
                     env_name=config.name,
-                    message="Failed to create environment with conda",
-                    details={"conda_error": result.stderr}
+                    message=f"Failed to create environment '{config.name}': {result.stderr}",
+                    details={
+                        "python_version": config.python_version,
+                        "packages": config.packages,
+                        "stdout": result.stdout,
+                        "stderr": result.stderr,
+                        "returncode": result.returncode
+                    }
                 )
-                return status.model_dump_json()
-                
-        except FileNotFoundError:
-            status = EnvironmentStatus(
-                success=False,
-                env_name=config.name,
-                message="conda command not found - please install conda",
-                details={"error": "conda not available"}
-            )
-        except subprocess.TimeoutExpired:
-            status = EnvironmentStatus(
-                success=False,
-                env_name=config.name,
-                message="conda environment creation timed out",
-                details={"error": "timeout"}
-            )
+        finally:
+            # Clean up temporary file
+            try:
+                Path(env_file).unlink()
+            except:
+                pass
+        
         return status.model_dump_json()
         
-    except yaml.YAMLError as e:
-        status = EnvironmentStatus(
-            success=False,
-            env_name="unknown",
-            message=f"Error parsing YAML config: {str(e)}",
-            details={"error_type": "YAMLError"}
-        )
-        return status.model_dump_json()
     except Exception as e:
         status = EnvironmentStatus(
             success=False,
             env_name="unknown",
-            message=f"Error creating environment: {str(e)}",
-            details={"error_type": type(e).__name__}
+            message=f"Environment creation failed: {str(e)}",
+            details={"error": str(e)}
         )
         return status.model_dump_json()
 
@@ -154,86 +144,85 @@ def validate_environment_func(validation_config: str) -> str:
     """Validate environment from config JSON string"""
     try:
         config = json.loads(validation_config)
-        env_name = config["env_name"]
-        packages_to_test = config.get("packages", [])
+        env_name = config.get("env_name")
+        packages = config.get("packages", [])
+        
+        if not env_name:
+            raise ValueError("env_name is required")
+        
+        # Test environment activation and package imports
+        validation_results = []
         
         # Check if environment exists
-        result = subprocess.run([
+        env_check = subprocess.run([
             "conda", "env", "list", "--json"
         ], capture_output=True, text=True)
         
-        if result.returncode != 0:
-            status = EnvironmentStatus(
-                success=False,
-                env_name=env_name,
-                message="Failed to list conda environments",
-                details={"error": result.stderr}
-            )
-            return status.model_dump_json()
+        if env_check.returncode != 0:
+            return json.dumps({
+                "success": False,
+                "env_name": env_name,
+                "message": "Could not list conda environments",
+                "details": {"error": env_check.stderr}
+            })
         
-        envs_data = json.loads(result.stdout)
+        envs_data = json.loads(env_check.stdout)
         env_paths = [Path(env_path).name for env_path in envs_data["envs"]]
         
         if env_name not in env_paths:
-            status = EnvironmentStatus(
-                success=False,
-                env_name=env_name,
-                message=f"Environment '{env_name}' not found",
-                details={"available_envs": env_paths}
-            )
-            return status.model_dump_json()
+            return json.dumps({
+                "success": False,
+                "env_name": env_name,
+                "message": f"Environment '{env_name}' does not exist",
+                "details": {"available_envs": env_paths}
+            })
         
         # Test package imports
-        import_results = {}
-        if packages_to_test:
-            for package in packages_to_test:
-                # Extract package name (remove version specs)
-                package_name = package.split("==")[0].split(">=")[0].split("<=")[0].split("~=")[0]
-                
-                # Test import in the environment
-                cmd = [
-                    "conda", "run", "-n", env_name,
-                    "python", "-c", f"import {package_name}; print('SUCCESS')"
-                ]
-                
-                try:
-                    import_result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-                    import_results[package_name] = {
-                        "success": import_result.returncode == 0,
-                        "output": import_result.stdout.strip(),
-                        "error": import_result.stderr.strip() if import_result.stderr else None
-                    }
-                except subprocess.TimeoutExpired:
-                    import_results[package_name] = {
-                        "success": False,
-                        "output": "",
-                        "error": "Import test timed out"
-                    }
+        for package in packages:
+            # Convert package name for import (e.g., "fastmcp" -> "fastmcp", "PyGithub" -> "github")
+            import_name = package.lower()
+            if package.lower() == "pygithub":
+                import_name = "github"
+            elif "-" in package:
+                import_name = package.replace("-", "_")
+            
+            test_code = f"import {import_name}; print(f'{import_name} imported successfully')"
+            
+            result = subprocess.run([
+                "conda", "run", "-n", env_name, "python", "-c", test_code
+            ], capture_output=True, text=True, timeout=30)
+            
+            validation_results.append({
+                "package": package,
+                "import_name": import_name,
+                "success": result.returncode == 0,
+                "output": result.stdout.strip(),
+                "error": result.stderr.strip() if result.stderr else None
+            })
         
         # Check overall success
-        all_imports_successful = all(
-            result["success"] for result in import_results.values()
-        ) if import_results else True
+        all_success = all(r["success"] for r in validation_results)
         
-        status = EnvironmentStatus(
-            success=all_imports_successful,
-            env_name=env_name,
-            message=f"Environment validation {'passed' if all_imports_successful else 'failed'}",
-            details={
-                "import_results": import_results,
-                "env_exists": True
+        status = {
+            "success": all_success,
+            "env_name": env_name,
+            "message": f"Environment '{env_name}' validation {'passed' if all_success else 'failed'}",
+            "details": {
+                "packages_tested": len(packages),
+                "packages_passed": sum(1 for r in validation_results if r["success"]),
+                "validation_results": validation_results
             }
-        )
-        return status.model_dump_json()
+        }
+        
+        return json.dumps(status)
         
     except Exception as e:
-        status = EnvironmentStatus(
-            success=False,
-            env_name=config.get("env_name", "unknown") if 'config' in locals() else "unknown",
-            message=f"Error validating environment: {str(e)}",
-            details={"error_type": type(e).__name__}
-        )
-        return status.model_dump_json()
+        return json.dumps({
+            "success": False,
+            "env_name": "unknown",
+            "message": f"Validation failed: {str(e)}",
+            "details": {"error": str(e)}
+        })
 
 
 def cleanup_environment_func(env_name: str) -> str:
@@ -243,374 +232,343 @@ def cleanup_environment_func(env_name: str) -> str:
             "conda", "env", "remove", "-n", env_name, "-y"
         ], capture_output=True, text=True, timeout=60)
         
-        status = EnvironmentStatus(
-            success=result.returncode == 0,
-            env_name=env_name,
-            message=f"Environment cleanup {'successful' if result.returncode == 0 else 'failed'}",
-            details={
-                "stdout": result.stdout,
-                "stderr": result.stderr
+        if result.returncode == 0:
+            status = {
+                "success": True,
+                "env_name": env_name,
+                "message": f"Environment '{env_name}' removed successfully",
+                "details": {"stdout": result.stdout}
             }
-        )
-        return status.model_dump_json()
+        else:
+            status = {
+                "success": False,
+                "env_name": env_name,
+                "message": f"Failed to remove environment '{env_name}': {result.stderr}",
+                "details": {
+                    "stdout": result.stdout,
+                    "stderr": result.stderr,
+                    "returncode": result.returncode
+                }
+            }
+        
+        return json.dumps(status)
         
     except Exception as e:
-        status = EnvironmentStatus(
-            success=False,
-            env_name=env_name,
-            message=f"Error during cleanup: {str(e)}",
-            details={"error_type": type(e).__name__}
+        return json.dumps({
+            "success": False,
+            "env_name": env_name,
+            "message": f"Environment cleanup failed: {str(e)}",
+            "details": {"error": str(e)}
+        })
+
+
+def generate_environment_config_with_gpt5(analysis_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Generate intelligent environment configuration using GPT-5-nano"""
+    try:
+        # Initialize OpenAI client
+        client = openai.OpenAI()
+        
+        # Extract context from analysis data
+        package_name = analysis_data.get("package_name", "unknown-sdk")
+        main_entry = analysis_data.get("main_entry", "")
+        import_module = analysis_data.get("import_module", "")
+        description = analysis_data.get("description", "")
+        functions = analysis_data.get("functions", [])
+        
+        # Create structured prompt for environment configuration
+        prompt = f"""# Environment Configuration Expert
+
+You are a world-class Python environment specialist who creates optimal conda environments for MCP (Model Context Protocol) servers.
+
+## SDK Information
+**Package**: {package_name}
+**Main Entry**: {main_entry}
+**Import Module**: {import_module}
+**Description**: {description}
+
+## Available Functions
+{json.dumps(functions[:10], indent=2) if functions else "No functions available"}
+
+## Core Requirements
+### MCP Server Environment
+- Must include `fastmcp` for MCP server framework
+- Must include the target SDK package: `{package_name}`
+- Include any required dependencies for the SDK
+- Use Python 3.11 for compatibility
+- Include common utilities (requests, json, pathlib, etc.)
+
+### Environment Configuration
+- Use conda-forge and defaults channels
+- Specify exact package versions when critical
+- Include development tools if needed (pytest, black, etc.)
+- Consider authentication dependencies (if SDK requires them)
+
+## Output Format
+Generate ONLY a JSON object with this exact structure:
+```json
+{{
+  "env_name": "mcp-{package_name.lower().replace('_', '-')}",
+  "python_version": "3.11",
+  "packages": ["package1", "package2", "package3"],
+  "channels": ["conda-forge", "defaults"],
+  "pip_packages": ["pip-only-package1", "pip-only-package2"],
+  "reasoning": "Brief explanation of package choices"
+}}
+```
+
+## Guidelines
+- Include ALL packages needed for the SDK to function
+- Add common MCP server dependencies
+- Consider authentication, HTTP clients, data processing libraries
+- Keep the environment minimal but complete
+- Use pip for packages not available in conda
+
+Generate ONLY the JSON object. No explanations or markdown formatting."""
+
+        # Call GPT-5-nano with proper parameters
+        response = client.chat.completions.create(
+            model="gpt-5-nano",
+            messages=[{"role": "user", "content": prompt}],
+            max_completion_tokens=4000  # Sufficient for environment config
         )
-        return status.model_dump_json()
+        
+        # Extract and parse the response
+        content = response.choices[0].message.content.strip()
+        
+        # Clean up the response (remove any markdown formatting)
+        if content.startswith("```json"):
+            content = content[7:]
+        if content.endswith("```"):
+            content = content[:-3]
+        content = content.strip()
+        
+        # Parse the JSON response
+        config = json.loads(content)
+        
+        # Validate the configuration
+        required_fields = ["env_name", "python_version", "packages", "channels"]
+        for field in required_fields:
+            if field not in config:
+                raise ValueError(f"Missing required field: {field}")
+        
+        # Ensure fastmcp is included
+        if "fastmcp" not in config["packages"]:
+            config["packages"].append("fastmcp")
+        
+        # Ensure the target package is included
+        if package_name and package_name != "unknown-sdk" and package_name not in config["packages"]:
+            config["packages"].append(package_name)
+        
+        return {
+            "success": True,
+            "config": config,
+            "usage": response.usage.model_dump() if response.usage else None
+        }
+        
+    except json.JSONDecodeError as e:
+        return {
+            "success": False,
+            "error": f"Failed to parse GPT-5 response as JSON: {e}",
+            "raw_response": content if 'content' in locals() else None
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"GPT-5 environment generation failed: {str(e)}"
+        }
 
 
-def extract_additional_packages_from_markdown(markdown_content: str, main_package: str) -> List[str]:
-    """Extract additional packages needed based on imports and examples in markdown"""
-    import re
-    
-    additional_packages = []
-    
-    # Extract imports from code blocks
-    code_blocks = re.findall(r'```python\n(.*?)\n```', markdown_content, re.DOTALL)
-    for code_block in code_blocks:
-        lines = code_block.split('\n')
-        for line in lines:
-            line = line.strip()
-            # Match various import patterns
-            if line.startswith('import ') or line.startswith('from '):
-                # from github import Github, Auth, InputFileContent
-                if 'import' in line:
-                    imports_match = re.search(r'from\s+(\w+)\s+import|import\s+(\w+)', line)
-                    if imports_match:
-                        module = imports_match.group(1) or imports_match.group(2)
-                        if module and module != main_package.lower() and module not in ['os', 'sys', 'json', 'time', 'datetime']:
-                            # Check if it's a submodule of main package
-                            if not module.startswith(main_package.lower()):
-                                # Don't add modules that are clearly the import name for the main package
-                                # (e.g., 'github' module for PyGithub package)
-                                primary_import = extract_primary_import_name(markdown_content, main_package)
-                                if module != primary_import:
-                                    additional_packages.append(module)
-    
-    # Look for specific patterns mentioning additional dependencies
-    dependency_patterns = [
-        r'pip install ([^`\s]+)',  # pip install commands
-        r'requirements\.txt.*?([a-zA-Z][a-zA-Z0-9_-]+[><=][\d.]+)',  # requirements.txt mentions
-        r'conda install ([^`\s]+)',  # conda install commands
-    ]
-    
-    for pattern in dependency_patterns:
-        matches = re.findall(pattern, markdown_content, re.IGNORECASE)
-        for match in matches:
-            package = match.strip()
-            if package and package != main_package and package not in ['python', 'pip']:
-                additional_packages.append(package)
-    
-    # Remove duplicates and common standard library packages
-    stdlib_packages = {'os', 'sys', 'json', 'time', 'datetime', 'subprocess', 'pathlib', 're', 'typing'}
-    additional_packages = list(set(additional_packages) - stdlib_packages)
-    
-    return additional_packages
-
-
-def extract_primary_import_name(markdown_content: str, package_name: str) -> str:
-    """Extract the primary import name for the package from markdown content"""
-    import re
-    
-    # Look for import statements in code blocks  
-    code_blocks = re.findall(r'```python\n(.*?)\n```', markdown_content, re.DOTALL)
-    
-    import_candidates = set()
-    
-    for code_block in code_blocks:
-        lines = code_block.split('\n')
-        for line in lines:
-            line = line.strip()
-            # Look for import patterns
-            if line.startswith('from ') and 'import' in line:
-                # from github import Github, Auth
-                match = re.search(r'from\s+(\w+)\s+import', line)
-                if match:
-                    module_name = match.group(1)
-                    import_candidates.add(module_name)
-            elif line.startswith('import '):
-                # import github
-                match = re.search(r'import\s+(\w+)', line)
-                if match:
-                    module_name = match.group(1)
-                    import_candidates.add(module_name)
-    
-    # Filter out standard library modules
-    stdlib_modules = {'os', 'sys', 'json', 'time', 'datetime', 'subprocess', 'pathlib', 're', 'typing'}
-    import_candidates = import_candidates - stdlib_modules
-    
-    # If we only have one candidate, use it
-    if len(import_candidates) == 1:
-        return list(import_candidates)[0]
-    
-    # If we have multiple candidates, prefer the one that's not the package name itself
-    # (e.g., PyGithub package uses 'github' module)
-    for candidate in import_candidates:
-        if candidate.lower() != package_name.lower():
-            return candidate
-    
-    # Fallback to the package name in lowercase
-    return package_name.lower() if import_candidates else None
 
 
 class EnvironmentAgent:
-    """LangChain agent for environment management"""
+    """Direct environment management agent with GPT-5-nano integration for intelligent configuration"""
     
-    def __init__(self, model: str = "gpt-5-nano", verbose: bool = False):
-        self.llm = ChatOpenAI(model=model, temperature=0)
+    def __init__(self, model: str = "gpt-5-nano", verbose: bool = False, use_gpt5: bool = True):
+        self.model = model
         self.verbose = verbose
-        
-        # Create tools using StructuredTool
-        self.tools = [
-            StructuredTool.from_function(
-                func=create_environment_func,
-                name="create_environment",
-                description="Create a new conda environment with specified packages"
-            ),
-            StructuredTool.from_function(
-                func=validate_environment_func,
-                name="validate_environment", 
-                description="Validate that environment exists and packages can be imported"
-            ),
-            StructuredTool.from_function(
-                func=cleanup_environment_func,
-                name="cleanup_environment",
-                description="Remove conda environment (useful for cleanup after failures)"
-            )
-        ]
-        
-        # Create agent prompt
-        self.prompt = ChatPromptTemplate.from_messages([
-            ("system", """You are an environment management specialist. Your job is to create and validate conda environments for MCP server development.
-
-Available tools:
-- create_environment: Create new conda environment with specified packages
-- validate_environment: Test that environment exists and packages import correctly  
-- cleanup_environment: Remove environment (use for failed setups)
-
-When creating environments:
-1. Parse the SDK analysis to determine required packages
-2. Use appropriate Python version (default 3.11)
-3. Include FastMCP and the target SDK package
-4. Handle conflicts by trying alternative approaches
-5. Always validate the environment after creation
-6. Clean up failed environments
-
-Be decisive and provide clear status updates. If something fails, try alternatives or suggest manual intervention."""),
-            ("human", "{input}"),
-            ("placeholder", "{agent_scratchpad}")
-        ])
-        
-        # Create agent
-        self.agent = create_openai_functions_agent(
-            llm=self.llm,
-            tools=self.tools,
-            prompt=self.prompt
-        )
-        
-        # Create executor
-        self.executor = AgentExecutor(
-            agent=self.agent,
-            tools=self.tools,
-            verbose=self.verbose,
-            max_iterations=5,
-            handle_parsing_errors=True
-        )
+        self.use_gpt5 = use_gpt5
     
-    def create_and_validate_environment(self, analysis_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Create environment based on SDK analysis and validate it"""
+    def create_environment(self, env_config: str) -> Dict[str, Any]:
+        """Create a conda environment from YAML config"""
+        result_json = create_environment_func(env_config)
+        return json.loads(result_json)
+    
+    def validate_environment(self, validation_config: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate that environment exists and packages can be imported"""
+        result_json = validate_environment_func(json.dumps(validation_config))
+        return json.loads(result_json)
+    
+    def cleanup_environment(self, env_name: str) -> Dict[str, Any]:
+        """Remove a conda environment"""
+        result_json = cleanup_environment_func(env_name)
+        return json.loads(result_json)
+    
+    def generate_environment_config(self, analysis_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Generate intelligent environment configuration using GPT-5-nano"""
+        if not self.use_gpt5:
+            # Fallback to template-based approach
+            return self._generate_template_config(analysis_data)
         
-        # Extract package info from analysis - handle nested structure
-        package_name = "unknown-sdk"
-        main_entry = ""
+        if self.verbose:
+            print(f"🤖 Generating environment configuration with GPT-5-nano...")
         
-        # First try direct access
-        # Extract package name from analysis data
+        result = generate_environment_config_with_gpt5(analysis_data)
+        
+        if result["success"]:
+            if self.verbose:
+                print(f"✅ GPT-5-nano generated environment configuration")
+                print(f"📦 Packages: {', '.join(result['config']['packages'])}")
+                if result['config'].get('reasoning'):
+                    print(f"💭 Reasoning: {result['config']['reasoning']}")
+        else:
+            if self.verbose:
+                print(f"⚠️  GPT-5-nano failed, falling back to template: {result['error']}")
+            # Fallback to template-based approach
+            result = self._generate_template_config(analysis_data)
+        
+        return result
+    
+    def _generate_template_config(self, analysis_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Fallback template-based environment configuration"""
         package_name = analysis_data.get("package_name", "unknown-sdk")
-        main_entry = analysis_data.get("main_entry_point", "")
+        clean_package_name = package_name.lower().replace("_", "-")
+        env_name = f"mcp-{clean_package_name}"
         
-        # Build environment name
-        env_name = f"mcp-{package_name.lower().replace('_', '-')}"
+        # Base packages for MCP server
+        packages = ["fastmcp"]
         
-        # Determine required packages
-        packages = [
-            "fastmcp>=0.1.0",
-            "pydantic>=2.0.0"
-        ]
-        
+        # Add the target SDK package
         if package_name and package_name != "unknown-sdk":
             packages.append(package_name)
+        
+        config = {
+            "env_name": env_name,
+            "python_version": "3.11",
+            "packages": packages,
+            "channels": ["conda-forge", "defaults"],
+            "pip_packages": [],
+            "reasoning": "Template-based configuration (GPT-5-nano fallback)"
+        }
+        
+        return {
+            "success": True,
+            "config": config,
+            "fallback": True
+        }
+    
+    def create_and_validate_environment(self, analysis_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Create and validate environment from SDK analysis data - main interface with GPT-5-nano"""
+        
+        # Generate intelligent environment configuration
+        config_result = self.generate_environment_config(analysis_data)
+        
+        if not config_result["success"]:
+            return {
+                "success": False,
+                "result": f"Failed to generate environment configuration: {config_result.get('error', 'Unknown error')}",
+                "env_name": "unknown",
+                "details": config_result
+            }
+        
+        config = config_result["config"]
+        env_name = config["env_name"]
+        packages = config["packages"]
+        pip_packages = config.get("pip_packages", [])
         
         # Create environment YAML configuration
         env_config_yaml = f"""name: {env_name}
 channels:
-  - conda-forge
+{chr(10).join(f"  - {channel}" for channel in config["channels"])}
 dependencies:
-  - python=3.11
+  - python={config["python_version"]}
   - pip
   - pip:
-    - fastmcp>=0.1.0
-    - pydantic>=2.0.0
-    - {package_name}
+{chr(10).join(f"    - {pkg}" for pkg in packages + pip_packages)}
 """
         
         try:
+            if self.verbose:
+                package_name = analysis_data.get("package_name", "unknown-sdk")
+                print(f"🔧 Creating environment '{env_name}' for {package_name}...")
+                if config_result.get("fallback"):
+                    print(f"📝 Using template-based configuration (GPT-5-nano fallback)")
+                else:
+                    print(f"🤖 Using GPT-5-nano generated configuration")
+            
             # Create the environment directly
             env_result = create_environment_func(env_config_yaml)
             env_status = json.loads(env_result)
             
             if env_status["success"]:
+                if self.verbose:
+                    print(f"✅ Environment created successfully")
+                    print(f"🧪 Validating environment...")
+                
                 # Validate the environment
                 validation_config = {
                     "env_name": env_name,
-                    "packages": packages
+                    "packages": packages + pip_packages
                 }
                 validation_result = validate_environment_func(json.dumps(validation_config))
                 validation_status = json.loads(validation_result)
                 
-                return {
-                    "success": validation_status["success"],
-                    "result": f"Environment '{env_name}' created and validated successfully" if validation_status["success"] else f"Environment created but validation failed: {validation_status['message']}",
-                    "env_name": env_name,
-                    "details": {
-                        "creation": env_status,
-                        "validation": validation_status
+                if validation_status["success"]:
+                    if self.verbose:
+                        print(f"✅ Environment validation passed")
+                    
+                    return {
+                        "success": True,
+                        "result": f"Environment '{env_name}' created and validated successfully",
+                        "env_name": env_name,
+                        "details": {
+                            "creation": env_status,
+                            "validation": validation_status,
+                            "config_generation": config_result,
+                            "reasoning": config.get("reasoning", "No reasoning provided")
+                        }
                     }
-                }
+                else:
+                    if self.verbose:
+                        print(f"⚠️  Environment validation failed")
+                    
+                    return {
+                        "success": False,
+                        "result": f"Environment created but validation failed: {validation_status['message']}",
+                        "env_name": env_name,
+                        "details": {
+                            "creation": env_status,
+                            "validation": validation_status,
+                            "config_generation": config_result
+                        }
+                    }
             else:
+                if self.verbose:
+                    print(f"❌ Environment creation failed")
+                
                 return {
                     "success": False,
                     "result": f"Environment creation failed: {env_status['message']}",
                     "env_name": env_name,
-                    "details": env_status
+                    "details": {
+                        "creation": env_status,
+                        "config_generation": config_result
+                    }
                 }
+                
         except Exception as e:
+            if self.verbose:
+                print(f"❌ Environment setup failed: {e}")
+            
             return {
                 "success": False,
                 "error": str(e),
-                "env_name": env_name
+                "env_name": env_name,
+                "details": {
+                    "config_generation": config_result
+                }
             }
 
 
-def main():
-    """CLI interface for environment agent"""
-    import argparse
-    
-    parser = argparse.ArgumentParser(description="Environment Agent - Create and validate conda environments")
-    parser.add_argument("--analysis", required=True, help="Path to SDK analysis markdown file (e.g., analysis/pygithub/detailed.md)")
-    parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
-    
-    args = parser.parse_args()
-    
-    # Load analysis data (markdown format only)
-    try:
-        if not args.analysis.endswith('.md'):
-            print(f"Error: Expected markdown file (.md), got: {args.analysis}")
-            sys.exit(1)
-            
-        from developer_agent import parse_markdown_analysis
-        with open(args.analysis, 'r', encoding='utf-8') as f:
-            markdown_content = f.read()
-        package_name, main_entry, auth_methods, main_classes = parse_markdown_analysis(markdown_content)
-        
-        # Extract additional packages from imports and code examples in the markdown
-        additional_packages = extract_additional_packages_from_markdown(markdown_content, package_name)
-    except Exception as e:
-        print(f"Error loading analysis file: {e}")
-        sys.exit(1)
-    
-    # Create environment directly without LangChain
-    env_name = f"mcp-{package_name.lower().replace('_', '-')}"
-    
-    print(f"Creating environment: {env_name}")
-    print(f"Main package: {package_name}")
-    if additional_packages:
-        print(f"Additional packages detected: {additional_packages}")
-    
-    # Build complete package list
-    pip_packages = [
-        "fastmcp>=0.1.0",
-        "pydantic>=2.0.0",
-        package_name
-    ]
-    
-    # Add additional packages if found
-    for pkg in additional_packages:
-        if pkg not in pip_packages:
-            pip_packages.append(pkg)
-    
-    # Create environment YAML configuration
-    pip_packages_yaml = "\n    - ".join(pip_packages)
-    env_config_yaml = f"""name: {env_name}
-channels:
-  - conda-forge
-dependencies:
-  - python=3.11
-  - pip
-  - pip:
-    - {pip_packages_yaml}
-"""
-    
-    if args.verbose:
-        print("Environment configuration:")
-        print(env_config_yaml)
-    
-    # Create the environment
-    env_result = create_environment_func(env_config_yaml)
-    env_status = json.loads(env_result)
-    
-    if env_status["success"]:
-        print(f"✅ Environment '{env_name}' created successfully!")
-        
-        # Validate the environment - extract actual import names from the markdown
-        validation_packages = ["fastmcp", "pydantic"]
-        
-        # Extract the actual import name from the main entry point in the analysis
-        if main_entry:
-            # main_entry might be like "github.Github" or just "Github"
-            if '.' in main_entry:
-                import_name = main_entry.split('.')[0]  # Get the module part
-            else:
-                import_name = main_entry.lower()
-            validation_packages.append(import_name)
-        else:
-            # Fallback: try to extract from markdown content
-            import_name = extract_primary_import_name(markdown_content, package_name)
-            if import_name:
-                validation_packages.append(import_name)
-            else:
-                validation_packages.append(package_name.lower())
-        
-        # Add additional packages (they should already have correct names from extraction)
-        validation_packages.extend(additional_packages)
-        
-        packages = validation_packages
-        validation_config = {
-            "env_name": env_name,
-            "packages": packages
-        }
-        validation_result = validate_environment_func(json.dumps(validation_config))
-        validation_status = json.loads(validation_result)
-        
-        if validation_status["success"]:
-            print(f"✅ Environment validation passed!")
-            if args.verbose:
-                print(f"Validation details: {validation_status}")
-        else:
-            print(f"⚠️  Environment created but validation failed: {validation_status['message']}")
-            if args.verbose:
-                print(f"Validation details: {validation_status}")
-    else:
-        print(f"❌ Environment creation failed: {env_status['message']}")
-        if args.verbose:
-            print(f"Creation details: {env_status}")
-        sys.exit(1)
-
-
 if __name__ == "__main__":
-    main()
+    print("Environment Agent - Use via workflow.py or import directly")
+    print("Example: from agents.environment_agent import EnvironmentAgent")

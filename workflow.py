@@ -43,6 +43,20 @@ def extract_package_name_from_analysis(analysis_path: str) -> str:
             if '.' in entry_point:
                 return entry_point.split('.')[0]
             return entry_point
+        
+        # Extract from title line (e.g., "# PyGithub - MCP Server Reference")
+        title_match = re.search(r'^#\s+([^-\n]+)', content, re.MULTILINE)
+        if title_match:
+            title = title_match.group(1).strip()
+            # Clean up title to extract just the package name
+            if ' - ' in title:
+                return title.split(' - ')[0].strip()
+            return title
+        
+        # Fallback: extract from first line if it looks like a package name
+        first_line = content.split('\n')[0].strip()
+        if first_line and not ' ' in first_line and first_line.islower():
+            return first_line
     
     return "unknown-sdk"
 
@@ -118,17 +132,26 @@ def run_environment_setup(analysis_path: str, verbose: bool = False) -> str:
     return env_name
 
 
-def run_code_generation(analysis_path: str, env_name: str, verbose: bool = False) -> str:
+def run_code_generation(analysis_path: str, env_name: str, output_dir: str = None, verbose: bool = False) -> str:
     """Generate the MCP server code and return the output directory"""
     import time
     
     print("⚡ Phase 3: Generating FastMCP server...")
     print(f"🎯 Environment: {env_name}")
     
+    # Determine output directory
+    if output_dir is None:
+        # Extract package name from analysis file (supports both JSON and markdown)
+        package_name = extract_package_name_from_analysis(analysis_path)
+        output_dir = f"output/{package_name.lower().replace('_', '-')}"
+    
+    print(f"📁 Output directory: {output_dir}")
+    
     start_time = time.time()
     cmd = ["python", "agents/developer_agent.py", 
            "--analysis", analysis_path, 
-           "--env-name", env_name]
+           "--env-name", env_name,
+           "--output-dir", output_dir]
     if verbose:
         cmd.append("--verbose")
         print(f"🚀 Running: {' '.join(cmd)}")
@@ -144,10 +167,6 @@ def run_code_generation(analysis_path: str, env_name: str, verbose: bool = False
             print(f"Output: {result.stdout}")
         sys.exit(1)
     
-    # Extract package name from analysis file (supports both JSON and markdown)
-    package_name = extract_package_name_from_analysis(analysis_path)
-    
-    output_dir = f"output/{package_name.lower().replace('_', '-')}"
     print(f"✅ MCP server generated in {gen_time:.1f}s")
     print(f"📁 Saved to: {output_dir}")
     return output_dir
@@ -159,6 +178,8 @@ def main():
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
     parser.add_argument("--skip-analysis", action="store_true", help="Skip analysis phase (use existing)")
     parser.add_argument("--skip-environment", action="store_true", help="Skip environment setup")
+    parser.add_argument("--output-dir", help="Custom output directory (default: output/{package-name}/)")
+
     
     args = parser.parse_args()
     
@@ -190,7 +211,7 @@ def main():
         env_name = run_environment_setup(analysis_path, args.verbose)
     
     # Phase 3: Code Generation
-    output_dir = run_code_generation(analysis_path, env_name, args.verbose)
+    output_dir = run_code_generation(analysis_path, env_name, args.output_dir, args.verbose)
     
     print()
     print("🎉 Workflow completed successfully!")

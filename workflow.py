@@ -16,47 +16,28 @@ from pathlib import Path
 
 
 def extract_package_name_from_analysis(analysis_path: str) -> str:
-    """Extract package name from analysis file (supports both JSON and markdown formats)"""
+    """Extract package name from analysis file using simple regex"""
     if not os.path.exists(analysis_path):
         return "unknown-sdk"
     
     with open(analysis_path, 'r', encoding='utf-8') as f:
         content = f.read()
     
-    # Handle markdown format
+    # Simple regex approach - look for "pip install <package>"
     if analysis_path.endswith('.md'):
-        # Extract from installation line (e.g., `pip install PyGithub`)
-        install_match = re.search(r'\*\*Installation:\*\*\s*`pip install ([^`]+)`', content)
+        install_match = re.search(r'pip install ([a-zA-Z0-9_-]+)', content)
         if install_match:
-            return install_match.group(1)
-        
-        # Extract from title line (e.g., "# PyGithub - MCP Server Reference")
-        title_match = re.search(r'^#\s+([^-\n]+)', content, re.MULTILINE)
-        if title_match:
-            return title_match.group(1).strip()
-        
-        # Extract from main entry point line
-        entry_match = re.search(r'\*\*Main Entry Point:\*\*\s*`([^`]+)`', content)
-        if entry_match:
-            entry_point = entry_match.group(1)
-            # Extract package name from import statement like "github.MainClass.Github"
-            if '.' in entry_point:
-                return entry_point.split('.')[0]
-            return entry_point
-        
-        # Extract from title line (e.g., "# PyGithub - MCP Server Reference")
-        title_match = re.search(r'^#\s+([^-\n]+)', content, re.MULTILINE)
-        if title_match:
-            title = title_match.group(1).strip()
-            # Clean up title to extract just the package name
-            if ' - ' in title:
-                return title.split(' - ')[0].strip()
-            return title
-        
-        # Fallback: extract from first line if it looks like a package name
-        first_line = content.split('\n')[0].strip()
-        if first_line and not ' ' in first_line and first_line.islower():
-            return first_line
+            package_name = install_match.group(1)
+            # Clean up the result
+            if 'Main' in package_name:
+                package_name = package_name.split('Main')[0]
+            if 'Entry' in package_name:
+                package_name = package_name.split('Entry')[0]
+            if 'Point' in package_name:
+                package_name = package_name.split('Point')[0]
+            if 'client' in package_name:
+                package_name = package_name.split('client')[0]
+            return package_name
     
     return "unknown-sdk"
 
@@ -108,7 +89,11 @@ def run_environment_setup(analysis_path: str, verbose: bool = False) -> str:
     # Extract package name from analysis file (supports both JSON and markdown)
     package_name = extract_package_name_from_analysis(analysis_path)
     
-    env_name = f"mcp-{package_name.lower().replace('_', '-')}"
+    # Clean package name for conda environment (remove special characters, spaces, etc.)
+    clean_package_name = re.sub(r'[^a-zA-Z0-9_-]', '-', package_name.lower())
+    clean_package_name = re.sub(r'-+', '-', clean_package_name)  # Replace multiple dashes with single dash
+    clean_package_name = clean_package_name.strip('-')  # Remove leading/trailing dashes
+    env_name = f"mcp-{clean_package_name}"
     print(f"🎯 Target environment: {env_name}")
     
     start_time = time.time()
@@ -143,7 +128,11 @@ def run_code_generation(analysis_path: str, env_name: str, output_dir: str = Non
     if output_dir is None:
         # Extract package name from analysis file (supports both JSON and markdown)
         package_name = extract_package_name_from_analysis(analysis_path)
-        output_dir = f"output/{package_name.lower().replace('_', '-')}"
+        # Clean package name for directory (remove special characters, spaces, etc.)
+        clean_package_name = re.sub(r'[^a-zA-Z0-9_-]', '-', package_name.lower())
+        clean_package_name = re.sub(r'-+', '-', clean_package_name)  # Replace multiple dashes with single dash
+        clean_package_name = clean_package_name.strip('-')  # Remove leading/trailing dashes
+        output_dir = f"output/{clean_package_name}"
     
     print(f"📁 Output directory: {output_dir}")
     
@@ -205,7 +194,11 @@ def main():
     if args.skip_environment:
         # Extract package name from analysis file (supports both JSON and markdown)
         package_name = extract_package_name_from_analysis(analysis_path)
-        env_name = f"mcp-{package_name.lower().replace('_', '-')}"
+        # Clean package name for conda environment (remove special characters, spaces, etc.)
+        clean_package_name = re.sub(r'[^a-zA-Z0-9_-]', '-', package_name.lower())
+        clean_package_name = re.sub(r'-+', '-', clean_package_name)  # Replace multiple dashes with single dash
+        clean_package_name = clean_package_name.strip('-')  # Remove leading/trailing dashes
+        env_name = f"mcp-{clean_package_name}"
         print(f"⏭️  Skipping environment setup, using: {env_name}")
     else:
         env_name = run_environment_setup(analysis_path, args.verbose)

@@ -32,21 +32,28 @@ class DeveloperStatus(BaseModel):
 
 
 def extract_package_info(markdown_content: str) -> tuple:
-    """Extract basic package information from markdown analysis (simplified)"""
+    """Extract basic package information from markdown analysis using improved logic"""
     
     package_name = "unknown-sdk"
     main_entry = ""
     import_module = ""
     
+    # Split content into lines once at the beginning
     lines = markdown_content.split('\n')
     
-    # Extract package name from installation line (most reliable)
-    for line in lines:
-        if '**Installation:**' in line and 'pip install' in line:
-            install_match = re.search(r'pip install ([^\s`]+)', line)
-            if install_match:
-                package_name = install_match.group(1)
-            break
+    # Use improved regex with cleanup (same as workflow)
+    install_match = re.search(r'pip install ([a-zA-Z0-9_-]+)', markdown_content)
+    if install_match:
+        package_name = install_match.group(1)
+        # Clean up the result (same cleanup as workflow)
+        if 'Main' in package_name:
+            package_name = package_name.split('Main')[0]
+        if 'Entry' in package_name:
+            package_name = package_name.split('Entry')[0]
+        if 'Point' in package_name:
+            package_name = package_name.split('Point')[0]
+        if 'client' in package_name:
+            package_name = package_name.split('client')[0]
     
     # Extract from title if installation not found
     if package_name == "unknown-sdk":

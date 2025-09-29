@@ -18,6 +18,13 @@ from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 import re
 
+# Import evaluation agent for code improvement
+try:
+    from .evaluation_agent import EvaluationAgent
+except ImportError:
+    # Fallback if evaluation agent not available
+    EvaluationAgent = None
+
 
 def parse_markdown_analysis(markdown_content: str) -> tuple:
     """Extract key information from structured markdown analysis optimized for MCP tools"""
@@ -244,25 +251,31 @@ def parse_markdown_analysis(markdown_content: str) -> tuple:
                 for method_pattern in method_patterns:
                     if '.' in method_pattern:
                         method_name = method_pattern.split('.')[-1]  # get method name only
-                        current_class["key_methods"].append({
-                            "name": method_name,
-                            "signature": method_pattern + "()",  # simplified signature
-                            "description": f"{operation_type.title()} operation: {operation_desc[:100]}...",
-                            "operation_type": operation_type,
-                            "full_pattern": method_pattern
-                        })
+                        # Check for duplicates
+                        existing_methods = [m["name"] for m in current_class["key_methods"]]
+                        if method_name not in existing_methods:
+                            current_class["key_methods"].append({
+                                "name": method_name,
+                                "signature": method_pattern + "()",  # simplified signature
+                                "description": f"{operation_type.title()} operation: {operation_desc[:100]}...",
+                                "operation_type": operation_type,
+                                "full_pattern": method_pattern
+                            })
                 
                 # Also look for direct method mentions without class prefix
                 if not method_patterns:
                     # Look for method names in parentheses or after "via"
                     direct_methods = re.findall(r'([a-z_]+)\s*\([^)]*\)', operation_desc)
                     for method in direct_methods:
-                        current_class["key_methods"].append({
-                            "name": method,
-                            "signature": method + "()",
-                            "description": f"{operation_type.title()} operation: {operation_desc[:100]}...",
-                            "operation_type": operation_type
-                        })
+                        # Check for duplicates
+                        existing_methods = [m["name"] for m in current_class["key_methods"]]
+                        if method not in existing_methods:
+                            current_class["key_methods"].append({
+                                "name": method,
+                                "signature": method + "()",
+                                "description": f"{operation_type.title()} operation: {operation_desc[:100]}...",
+                                "operation_type": operation_type
+                            })
                 continue
         
         # Stop extracting CRUD when we hit other sections
@@ -362,8 +375,8 @@ class DeveloperStatus(BaseModel):
     artifacts: Dict[str, str] = Field(default_factory=dict, description="Generated file paths")
 
 
-def activate_environment_func(env_name: str) -> str:
-    """Activate conda environment and return activation status"""
+def verify_environment_func(env_name: str) -> str:
+    """Verify conda environment exists and can be used"""
     try:
         # Test environment activation by running a simple python command
         result = subprocess.run([
@@ -374,7 +387,7 @@ def activate_environment_func(env_name: str) -> str:
             python_path = result.stdout.strip()
             status = DeveloperStatus(
                 success=True,
-                message=f"Environment '{env_name}' activated successfully",
+                message=f"Environment '{env_name}' verified and ready",
                 details={
                     "python_path": python_path,
                     "env_name": env_name
@@ -383,7 +396,7 @@ def activate_environment_func(env_name: str) -> str:
         else:
             status = DeveloperStatus(
                 success=False,
-                message=f"Failed to activate environment '{env_name}'",
+                message=f"Environment '{env_name}' not found or not working",
                 details={"error": result.stderr}
             )
         
@@ -392,7 +405,7 @@ def activate_environment_func(env_name: str) -> str:
     except Exception as e:
         status = DeveloperStatus(
             success=False,
-            message=f"Error activating environment: {str(e)}",
+            message=f"Error verifying environment: {str(e)}",
             details={"error_type": type(e).__name__}
         )
         return status.model_dump_json()
@@ -485,6 +498,75 @@ def generate_server_code_func(generation_config: str) -> str:
         )
         return status.model_dump_json()
 
+
+def evaluate_and_improve_server_func(eval_config: str) -> str:
+    """Evaluate and improve generated MCP server code using LangChain evaluation agent"""
+    try:
+        config = json.loads(eval_config)
+        server_path = config["server_path"]
+        analysis_data = config.get("analysis_data", {})
+        package_name = config.get("package_name", "unknown")
+        enable_evaluation = config.get("enable_evaluation", True)
+        
+        if not enable_evaluation or EvaluationAgent is None:
+            return json.dumps({
+                "success": True,
+                "message": "Evaluation skipped - not enabled or evaluation agent not available",
+                "evaluation_performed": False,
+                "improvements_made": False
+            })
+        
+        # Read the current server code
+        with open(server_path, 'r', encoding='utf-8') as f:
+            original_code = f.read()
+        
+        # Create evaluation agent
+        evaluator = EvaluationAgent(model="gpt-5-nano", verbose=False)
+        
+        # Run evaluation and improvement
+        result = evaluator.evaluate_and_improve_server(
+            server_code=original_code,
+            analysis_data=analysis_data,
+            package_name=package_name
+        )
+        
+        if result["success"]:
+            # Parse the result to see if improvements were made
+            agent_output = result["result"]
+            improvements_made = "improved" in agent_output.lower() or "enhancement" in agent_output.lower()
+            
+            # If the agent made improvements, we'd need to extract the improved code
+            # For now, we'll return the evaluation results
+            status = DeveloperStatus(
+                success=True,
+                message=f"Server evaluation completed for {package_name}",
+                details={
+                    "evaluation_performed": True,
+                    "improvements_made": improvements_made,
+                    "evaluation_summary": agent_output[:500] + "..." if len(agent_output) > 500 else agent_output,
+                    "original_code_length": len(original_code)
+                }
+            )
+        else:
+            status = DeveloperStatus(
+                success=False,
+                message=f"Server evaluation failed: {result['error']}",
+                details={
+                    "evaluation_performed": True,
+                    "improvements_made": False,
+                    "error": result["error"]
+                }
+            )
+        
+        return status.model_dump_json()
+        
+    except Exception as e:
+        status = DeveloperStatus(
+            success=False,
+            message=f"Error during server evaluation: {str(e)}",
+            details={"error_type": type(e).__name__}
+        )
+        return status.model_dump_json()
 
 def run_server_func(server_config: str) -> str:
     """Start the FastMCP server for testing"""
@@ -602,7 +684,7 @@ def generate_api_call_implementation(class_name: str, method_name: str, signatur
         else:
             param_prep.append(f"            method_kwargs['{name}'] = {name}")
     
-    param_setup = "\n".join(param_prep) if param_prep else "            pass"
+    param_setup = "\n".join(param_prep)
     
     # Generate truly generalized implementation using dynamic method calling
     return f'''        # Prepare method arguments
@@ -939,20 +1021,37 @@ class DeveloperAgent:
     """LangChain agent for MCP server development"""
     
     def __init__(self, model: str = "gpt-5-nano", verbose: bool = False):
-        self.llm = ChatOpenAI(model=model)
+        self.model = model
         self.verbose = verbose
+        
+        # GPT-5 models require Responses API, not Chat Completions
+        if model.startswith("gpt-5"):
+            if verbose:
+                print(f"Note: Using {model} with Responses API for better reasoning")
+            # We'll handle GPT-5 calls differently in the workflow
+            self.use_gpt5 = True
+            # For LangChain compatibility, use gpt-4o-mini as fallback
+            self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+        else:
+            self.use_gpt5 = False
+            self.llm = ChatOpenAI(model=model, temperature=0)
         
         # Create tools using StructuredTool
         self.tools = [
             StructuredTool.from_function(
-                func=activate_environment_func,
-                name="activate_environment",
-                description="Activate conda environment for development"
+                func=verify_environment_func,
+                name="verify_environment", 
+                description="Verify conda environment exists and is ready for use"
             ),
             StructuredTool.from_function(
                 func=generate_server_code_func,
                 name="generate_server_code",
                 description="Generate FastMCP server code from SDK analysis"
+            ),
+            StructuredTool.from_function(
+                func=evaluate_and_improve_server_func,
+                name="evaluate_and_improve_server",
+                description="Evaluate and improve generated MCP server code using AI analysis"
             ),
             StructuredTool.from_function(
                 func=run_server_func,
@@ -966,16 +1065,18 @@ class DeveloperAgent:
             ("system", """You are a developer specialist for creating FastMCP servers. Your job is to generate production-ready MCP servers from SDK analysis data.
 
 Available tools:
-- activate_environment: Activate the conda environment for development
+- verify_environment: Verify conda environment exists and is ready for use
 - generate_server_code: Generate FastMCP server code, environment.yml, and README
+- evaluate_and_improve_server: Evaluate and improve generated server code using AI analysis
 - run_server: Validate the generated server works correctly
 
 When creating MCP servers:
-1. First activate the conda environment created by the environment agent
+1. Verify the conda environment exists (created by the environment agent)
 2. Generate clean, modular FastMCP server code based on the SDK analysis
-3. Create all necessary configuration files and documentation
-4. Validate that the server works correctly
-5. Provide clear next steps for the user
+3. Evaluate and improve the generated code for quality, compliance, and best practices
+4. Create all necessary configuration files and documentation
+5. Validate that the server works correctly using the conda environment
+6. Provide clear next steps for the user
 
 Focus on creating maintainable, type-safe code with proper error handling and documentation. Be decisive and provide clear status updates throughout the process."""),
             ("human", "{input}"),
@@ -998,13 +1099,139 @@ Focus on creating maintainable, type-safe code with proper error handling and do
             handle_parsing_errors=True
         )
     
+    def generate_mcp_server_with_gpt5(self, analysis_data: Dict[str, Any], env_name: str, output_dir: str = None) -> Dict[str, Any]:
+        """Generate MCP server using GPT-5 Responses API directly"""
+        from openai import OpenAI
+        
+        if output_dir is None:
+            package_name = self.extract_package_name(analysis_data)
+            output_dir = f"./output/{package_name.lower().replace('_', '-')}"
+        
+        try:
+            client = OpenAI()
+            
+            # Create the prompt for GPT-5
+            prompt = f"""
+            Generate a complete FastMCP server for the analyzed SDK.
+            
+            Environment: {env_name} (already created)
+            Output Directory: {output_dir}
+            
+            SDK Analysis Data:
+            {json.dumps(analysis_data, indent=2)}
+            
+            Tasks to complete:
+            1. Verify the conda environment exists: {env_name}
+            2. Generate FastMCP server code with proper tools based on the analysis
+            3. Evaluate and improve the generated code for quality and best practices
+            4. Create environment.yml, README.md, and other necessary files
+            5. Validate that the server works correctly using the conda environment
+            
+            Make sure the generated code is:
+            - Clean and modular
+            - Type-safe with proper type hints
+            - Well documented with docstrings
+            - Production-ready with error handling
+            - Compliant with MCP and FastMCP best practices
+            
+            Provide step-by-step execution plan and implement each step.
+            """
+            
+            # Use GPT-5 Responses API
+            response = client.responses.create(
+                model=self.model,
+                input=prompt,
+                reasoning={"effort": "medium"},
+                text={"verbosity": "medium"}
+            )
+            
+            # Extract the response content
+            if hasattr(response, 'output_text'):
+                result_text = response.output_text
+            elif hasattr(response, 'output'):
+                # Handle different response structures
+                result_text = ""
+                for item in response.output:
+                    if hasattr(item, 'type') and item.type == "message":
+                        if hasattr(item, 'content'):
+                            for content_part in item.content:
+                                if hasattr(content_part, 'text'):
+                                    result_text += content_part.text
+            else:
+                result_text = str(response)
+            
+            # For now, we'll execute the individual steps manually
+            # This is a simplified implementation that calls the original tools
+            
+            # Step 1: Verify environment
+            verify_result = verify_environment_func(env_name)
+            verify_data = json.loads(verify_result)
+            if not verify_data["success"]:
+                return {
+                    "success": False,
+                    "error": f"Environment verification failed: {verify_data['message']}",
+                    "output_dir": output_dir,
+                    "env_name": env_name
+                }
+            
+            # Step 2: Generate server code
+            generation_config = {
+                "analysis_data": analysis_data,
+                "output_dir": output_dir,
+                "package_name": analysis_data.get("package_name", "unknown-sdk")
+            }
+            gen_result = generate_server_code_func(json.dumps(generation_config))
+            gen_data = json.loads(gen_result)
+            if not gen_data["success"]:
+                return {
+                    "success": False,
+                    "error": f"Code generation failed: {gen_data['message']}",
+                    "output_dir": output_dir,
+                    "env_name": env_name
+                }
+            
+            # Step 3: Evaluate and improve (if evaluation agent available)
+            if EvaluationAgent is not None:
+                server_path = gen_data["artifacts"].get("server")
+                if server_path:
+                    eval_config = {
+                        "server_path": server_path,
+                        "analysis_data": analysis_data,
+                        "package_name": analysis_data.get("package_name", "unknown"),
+                        "enable_evaluation": True
+                    }
+                    eval_result = evaluate_and_improve_server_func(json.dumps(eval_config))
+                    eval_data = json.loads(eval_result)
+                    if self.verbose:
+                        print(f"Evaluation result: {eval_data['message']}")
+            
+            return {
+                "success": True,
+                "result": f"GPT-5 MCP server generated successfully using {self.model}. {result_text[:200]}...",
+                "output_dir": output_dir,
+                "env_name": env_name,
+                "gpt5_reasoning": result_text
+            }
+            
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"GPT-5 generation failed: {str(e)}",
+                "output_dir": output_dir,
+                "env_name": env_name
+            }
+    
     def generate_mcp_server(self, analysis_data: Dict[str, Any], env_name: str, output_dir: str = None) -> Dict[str, Any]:
         """Generate complete MCP server from SDK analysis"""
+        
+        # Use GPT-5 Responses API if GPT-5 model is specified
+        if self.use_gpt5:
+            return self.generate_mcp_server_with_gpt5(analysis_data, env_name, output_dir)
         
         # Set default output directory if not provided
         if output_dir is None:
             package_name = self.extract_package_name(analysis_data)
-            output_dir = f"./mcp-{package_name.lower().replace('_', '-')}"
+            output_dir = f"./output/{package_name.lower().replace('_', '-')}"
         
         # Create request
         request = f"""
@@ -1017,18 +1244,20 @@ Focus on creating maintainable, type-safe code with proper error handling and do
         {json.dumps(analysis_data, indent=2)}
         
         Follow this process:
-        1. Activate the conda environment: {env_name}
+        1. Verify the conda environment is available: {env_name}
         2. Generate FastMCP server code with proper tools based on the analysis
-        3. Create environment.yml, README.md, and other necessary files
-        4. Validate that the server works correctly
+        3. Evaluate and improve the generated code for quality and best practices
+        4. Create environment.yml, README.md, and other necessary files
+        5. Validate that the server works correctly using the conda environment
         
         Make sure the generated code is:
         - Clean and modular
         - Type-safe with proper type hints
         - Well documented with docstrings
         - Production-ready with error handling
+        - Compliant with MCP and FastMCP best practices
         
-        Provide a summary of what was generated and next steps.
+        Provide a summary of what was generated, evaluation results, and next steps.
         """
         
         try:

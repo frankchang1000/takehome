@@ -2,88 +2,91 @@
 
 Convert SDK repositories into Model Context Protocol (MCP) servers using AI-powered analysis and code generation.
 
-## 🏗 Project Structure
+## Setup
 
-```
-a37/
-├── agents/                     # Specialized agents
-│   ├── __init__.py
-│   ├── environment_agent.py    # Conda environment management
-│   ├── developer_agent.py      # FastMCP server generation
-│   └── evaluation_agent.py     # Code quality evaluation & improvement
-├── analysis/                   # SDK analysis results  
-│   └── {sdk_name}/
-│       └── detailed.md         # Comprehensive MCP-focused documentation
-├── output/                     # Generated MCP servers
-│   └── {sdk_name}/
-│       ├── server.py           # FastMCP server implementation
-│       ├── environment.yml     # Conda environment spec
-│       └── README.md           # Usage instructions
-├── docs/                       # Documentation
-│   ├── plans/                  # Development plans
-│   └── plan.md                 # Main project plan
-├── main.py                     # SDK analysis tool
-├── workflow.py                 # Complete workflow orchestration
-└── requirements.txt            # Python dependencies
-```
-
-## 🚀 Quick Start
-
-### Full Workflow (Recommended)
+### Clone and Install
 ```bash
-# Run complete SDK to MCP conversion
-python workflow.py --repo https://github.com/PyGithub/PyGithub --verbose
+git clone https://github.com/frankchang1000/a37.git
+cd a37
+pip install -r requirements.txt
 ```
 
-### Step-by-Step
-
-1. **Analyze SDK**
-```bash
-python main.py --repo https://github.com/PyGithub/PyGithub
-# Creates: analysis/pygithub/detailed.md
-```
-
-2. **Generate Environment & MCP Server**
-```bash
-python workflow.py --repo https://github.com/PyGithub/PyGithub --skip-analysis --verbose
-# Uses existing analysis, creates environment + server
-```
-
-3. **Test MCP Server**
-```bash
-conda activate mcp-pygithub
-cd output/pygithub
-fastmcp dev server.py
-```
-
-
-## 🛠 Configuration
-
-### Environment Variables
+### Configure API Key
 ```bash
 export OPENAI_API_KEY="your-api-key"
 ```
 
-### CLI Options
+## Usage
+
+### Full Automated Workflow (Not Recommended)
+The complete automated workflow uses GPT-5-mini for SDK analysis, which is expensive and slow due to extensive web search and multiple API calls:
+
 ```bash
-# Analysis options
-python main.py --help
-
-# Environment agent options  
-python agents/environment_agent.py --help
-
-# Developer agent options (includes evaluation)
-python agents/developer_agent.py --help
-
-# Workflow options
-python workflow.py --help
+python workflow.py --repo https://github.com/PyGithub/PyGithub --verbose
 ```
 
+### Recommended Approach
 
-## 🔧 Development
+**Step 1: Manual Analysis (Recommended)**
+Instead of the expensive automated analysis, use Gemini Deep Research or similar tools to generate SDK analysis similar to the examples in the `analysis/` directory. The analysis should follow this format:
+- Authentication setup and code examples
+- Resource types and CRUD operations
+- Usage patterns and technical details
+- Error handling and rate limits
 
-### Adding New SDK Support
-1. Run analysis: `python main.py --repo YOUR_SDK_URL`
-2. Check generated analysis in `analysis/{sdk_name}/`
-3. Test the workflow: `python workflow.py --repo YOUR_SDK_URL`
+See `analysis/pygithub/detailed.md` or `analysis/kubernetes/detailed.md` for reference formats.
+
+**Step 2: Generate MCP Server**
+Once you have the analysis file, run the MCP generation process:
+
+```bash
+python workflow.py --repo https://github.com/PyGithub/PyGithub --skip-analysis --output-dir output_pygithub_test --verbose
+```
+
+## Pipeline Architecture
+
+The MCP generation pipeline consists of three main phases:
+
+### Phase 1: SDK Analysis (Skipped with --skip-analysis)
+- Uses `main.py` to perform 4-stage web search analysis via OpenAI
+- Generates comprehensive markdown documentation in `analysis/{sdk_name}/detailed.md`
+- Expensive: requires multiple GPT-5-mini API calls with web search
+- The PyGithub analysis example was generated with this process, and took about 10 minutes to complete and burned a lot of money.
+
+### Phase 2: Environment Setup
+- **Agent**: `agents/environment_agent.py`
+- Extracts package dependencies from analysis
+- Creates conda environment specification (`environment.yml`)
+- Validates environment creation and package availability
+- **Output**: Conda environment named `mcp-{package_name}`
+
+### Phase 3: Code Generation and Improvement
+- **Agent**: `agents/developer_agent.py`
+- Generates FastMCP server code using GPT-5-nano
+- Creates complete server implementation with SDK integration
+- **Sub-process**: Self-evaluation and improvement
+  - **Agent**: `agents/evaluation_agent.py`
+  - Evaluates generated code for quality, MCP compliance, and SDK integration
+  - Automatically improves code based on evaluation feedback
+  - Validates improved code compiles and runs
+- **Output**: Complete MCP server in `{output_dir}/server.py`
+
+### Generated Artifacts
+Each successful run produces:
+- `server.py` - FastMCP server implementation
+- `environment.yml` - Conda environment specification  
+- `README.md` - Usage and setup instructions
+
+## Testing the Generated MCP Server
+
+```bash
+# Activate the generated environment
+conda activate mcp-{package_name}
+
+# Navigate to output directory
+cd {output_dir}
+
+# Run the MCP server in development mode
+fastmcp dev server.py
+```
 

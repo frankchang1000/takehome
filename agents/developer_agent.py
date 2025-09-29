@@ -245,18 +245,20 @@ def parse_markdown_analysis(markdown_content: str) -> tuple:
                 operation_desc = crud_match.group(2)
                 
                 # Extract method names from the description
-                # Look for patterns like "Organization.create_repo(...)" or "Repository.edit(...)"
-                method_patterns = re.findall(r'([A-Za-z_]+\.[a-z_]+)\s*\([^)]*\)', operation_desc)
+                # Look for patterns like "Organization.create_repo(name, ...)" or "Repository.edit(name=..., description=...)"
+                method_patterns = re.findall(r'([A-Za-z_]+\.[a-z_]+)\s*\(([^)]*)\)', operation_desc)
                 
-                for method_pattern in method_patterns:
+                for method_pattern, params in method_patterns:
                     if '.' in method_pattern:
                         method_name = method_pattern.split('.')[-1]  # get method name only
                         # Check for duplicates
                         existing_methods = [m["name"] for m in current_class["key_methods"]]
                         if method_name not in existing_methods:
+                            # Preserve the full signature with parameters
+                            full_signature = f"{method_pattern}({params})"
                             current_class["key_methods"].append({
                                 "name": method_name,
-                                "signature": method_pattern + "()",  # simplified signature
+                                "signature": full_signature,
                                 "description": f"{operation_type.title()} operation: {operation_desc[:100]}...",
                                 "operation_type": operation_type,
                                 "full_pattern": method_pattern
@@ -621,7 +623,7 @@ def run_server_func(server_config: str) -> str:
 
 
 def extract_method_parameters(signature: str) -> List[Dict]:
-    """Extract parameters from method signature"""
+    """Extract parameters from method signature (handles both Python signatures and natural language descriptions)"""
     import re
     
     # Simple parameter extraction from signature
@@ -629,22 +631,43 @@ def extract_method_parameters(signature: str) -> List[Dict]:
     if not match:
         return []
     
-    params_str = match.group(1)
-    if not params_str.strip():
+    params_str = match.group(1).strip()
+    if not params_str:
         return []
     
-    # Split parameters and clean them up
+    # Handle natural language patterns like "name, ..." or "title, body=..., assignees=..."
     params = []
+    
+    # Split parameters and clean them up
     for param in params_str.split(','):
         param = param.strip()
+        
+        # Skip ellipsis and empty params
+        if param in ['...', ''] or param.startswith('...'):
+            continue
+            
+        # Handle parameters with default values (name=value)
         if '=' in param:
             name, default = param.split('=', 1)
             name = name.strip().split(':')[0].strip()  # Remove type hints
-            if name and name != 'self' and 'NotSet' not in name:
-                params.append({"name": name, "default": default.strip(), "required": False})
+            default = default.strip()
+            
+            # Clean up the name (remove dots, extra chars)
+            name = re.sub(r'[^a-zA-Z0-9_]', '', name)
+            
+            if name and name != 'self' and 'NotSet' not in name and len(name) > 0:
+                # Set reasonable defaults
+                if default in ['...', '""', "''"] or not default:
+                    default = 'None'
+                params.append({"name": name, "default": default, "required": False})
         else:
+            # Handle required parameters
             name = param.split(':')[0].strip()  # Remove type hints
-            if name and name != 'self':
+            
+            # Clean up the name (remove dots, extra chars, handle patterns like "full_name_or_id")
+            name = re.sub(r'[^a-zA-Z0-9_]', '', name)
+            
+            if name and name != 'self' and len(name) > 0:
                 params.append({"name": name, "required": True})
     
     return params[:5]  # Limit to 5 parameters to keep tools manageable
@@ -662,11 +685,11 @@ def generate_parameter_definitions(params: List[Dict]) -> str:
             param_strs.append(f"{name}: str")
         else:
             default_val = param.get("default", "None")
-            if default_val == "NotSet" or "NotSet" in default_val:
+            if default_val == "NotSet" or "NotSet" in default_val or default_val in ['...', '""', "''"]:
                 default_val = "None"
             param_strs.append(f"{name}: str = {default_val}")
     
-    return ", " + ", ".join(param_strs) if param_strs else ""
+    return ", ".join(param_strs) if param_strs else ""
 
 
 def generate_api_call_implementation(class_name: str, method_name: str, signature: str, params: List[Dict]) -> str:
@@ -679,10 +702,10 @@ def generate_api_call_implementation(class_name: str, method_name: str, signatur
     for param in params:
         name = param["name"]
         if not param.get("required", True):
-            param_prep.append(f"            if {name} is not None and {name} != 'None':")
-            param_prep.append(f"                method_kwargs['{name}'] = {name}")
-        else:
+            param_prep.append(f"        if {name} is not None and {name} != 'None':")
             param_prep.append(f"            method_kwargs['{name}'] = {name}")
+        else:
+            param_prep.append(f"        method_kwargs['{name}'] = {name}")
     
     param_setup = "\n".join(param_prep)
     

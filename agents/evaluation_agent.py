@@ -17,7 +17,6 @@ from langchain.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
-
 class EvaluationResult(BaseModel):
     """Results from MCP server evaluation"""
     code_quality_score: float = Field(description="Code quality score (1-10)")
@@ -413,8 +412,6 @@ Focus on:
                 "error": str(e),
                 "package_name": package_name
             }
-
-
 def main():
     """CLI interface for evaluation agent"""
     import argparse
@@ -426,6 +423,7 @@ def main():
     parser.add_argument("--model", default="gpt-5-nano", help="OpenAI model to use")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
     parser.add_argument("--output-path", help="Path to save improved server code")
+    parser.add_argument("--env-name", help="Conda environment name for functional testing")
     
     args = parser.parse_args()
     
@@ -465,11 +463,6 @@ def main():
     
     # Run evaluation and improvement
     print(f"Evaluating MCP server for {package_name}...")
-    result = agent.evaluate_and_improve_server(
-        server_code=server_code,
-        analysis_data=analysis_data,
-        package_name=package_name
-    )
     
     if result["success"]:
         print("✅ Evaluation completed successfully!")

@@ -8,8 +8,8 @@ The motivation for the structure of this project follows from this paper: https:
 
 ### Clone and Install
 ```bash
-git clone https://github.com/frankchang1000/a37.git
-cd a37
+git clone https://github.com/frankchang1000/takehome.git
+cd takehome
 pip install -r requirements.txt
 ```
 
